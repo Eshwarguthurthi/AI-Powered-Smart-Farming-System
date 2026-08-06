@@ -1,0 +1,13 @@
+{
+  "name": "AI-powered precision agriculture system",
+  "description": "A comprehensive decision-support system leveraging AI for crop recommendations, diseased diagnostics, and regional market intelligence.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API",
+    "AI-powered crop analysis",
+    "Revenue prediction",
+    "Disease diagnostics"
+  ]
+}
