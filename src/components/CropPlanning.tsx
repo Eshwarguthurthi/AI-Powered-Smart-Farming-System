@@ -21,6 +21,45 @@ import { toast } from "sonner";
 
 import { useLanguage } from '../contexts/LanguageContext';
 
+const soilProfiles: Record<string, { n: number; p: number; k: number; ph: number }> = {
+  "Andaman and Nicobar Islands": { n: 42, p: 24, k: 38, ph: 6.1 },
+  "Andhra Pradesh": { n: 36, p: 28, k: 42, ph: 7.4 },
+  "Arunachal Pradesh": { n: 58, p: 22, k: 35, ph: 5.8 },
+  Assam: { n: 62, p: 26, k: 44, ph: 5.6 },
+  Bihar: { n: 68, p: 38, k: 48, ph: 7.2 },
+  Chandigarh: { n: 72, p: 42, k: 54, ph: 7.8 },
+  Chhattisgarh: { n: 48, p: 24, k: 36, ph: 6.5 },
+  "Dadra and Nagar Haveli and Daman and Diu": { n: 44, p: 30, k: 40, ph: 6.8 },
+  Delhi: { n: 64, p: 36, k: 52, ph: 7.9 },
+  Goa: { n: 46, p: 20, k: 48, ph: 5.9 },
+  Gujarat: { n: 32, p: 34, k: 46, ph: 7.8 },
+  Haryana: { n: 78, p: 44, k: 58, ph: 8.0 },
+  "Himachal Pradesh": { n: 54, p: 30, k: 40, ph: 6.2 },
+  "Jammu and Kashmir": { n: 50, p: 28, k: 44, ph: 6.6 },
+  Jharkhand: { n: 40, p: 22, k: 32, ph: 5.7 },
+  Karnataka: { n: 38, p: 26, k: 34, ph: 6.8 },
+  Kerala: { n: 52, p: 24, k: 56, ph: 5.5 },
+  Ladakh: { n: 18, p: 16, k: 24, ph: 7.6 },
+  Lakshadweep: { n: 34, p: 18, k: 45, ph: 6.0 },
+  "Madhya Pradesh": { n: 46, p: 32, k: 44, ph: 7.1 },
+  Maharashtra: { n: 40, p: 35, k: 30, ph: 6.5 },
+  Manipur: { n: 56, p: 25, k: 38, ph: 5.9 },
+  Meghalaya: { n: 60, p: 20, k: 42, ph: 5.3 },
+  Mizoram: { n: 44, p: 18, k: 30, ph: 5.2 },
+  Nagaland: { n: 52, p: 21, k: 34, ph: 5.6 },
+  Odisha: { n: 50, p: 27, k: 40, ph: 6.2 },
+  Puducherry: { n: 38, p: 31, k: 44, ph: 7.0 },
+  Punjab: { n: 84, p: 48, k: 62, ph: 8.1 },
+  Rajasthan: { n: 24, p: 30, k: 28, ph: 8.2 },
+  Sikkim: { n: 48, p: 19, k: 36, ph: 5.5 },
+  "Tamil Nadu": { n: 34, p: 29, k: 38, ph: 7.3 },
+  Telangana: { n: 35, p: 30, k: 36, ph: 7.5 },
+  Tripura: { n: 58, p: 23, k: 46, ph: 5.8 },
+  "Uttar Pradesh": { n: 76, p: 46, k: 56, ph: 7.7 },
+  Uttarakhand: { n: 56, p: 27, k: 42, ph: 6.1 },
+  "West Bengal": { n: 70, p: 34, k: 52, ph: 6.4 },
+};
+
 export default function CropPlanning({ selectedState }: { selectedState: string }) {
   const { t } = useLanguage();
   const [loading, setLoading] = useState(false);
@@ -37,9 +76,15 @@ export default function CropPlanning({ selectedState }: { selectedState: string 
     acres: 1
   });
 
-  // Keep form data region in sync with global selection
   React.useEffect(() => {
-    setFormData(prev => ({ ...prev, region: selectedState }));
+    const profile = soilProfiles[selectedState] || soilProfiles.Maharashtra;
+    setFormData(prev => ({
+      ...prev,
+      ...profile,
+      region: selectedState,
+    }));
+    setRecommendations([]);
+    setSelectedIndex(0);
   }, [selectedState]);
 
   const handleSubmit = async (e: React.FormEvent) => {
