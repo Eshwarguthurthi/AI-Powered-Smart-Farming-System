@@ -1,0 +1,11 @@
+{
+  "source": "Local Government Directory (LGD), Ministry of Panchayati Raj, Government of India",
+  "sourceUrl": "https://lgdirectory.gov.in",
+  "fetchedAt": "2026-10-15T11:12:54.000Z",
+  "counts": {
+    "states": 36,
+    "districts": 784,
+    "subdistricts": 7092,
+    "villages": 677666
+  }
+}

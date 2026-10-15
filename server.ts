@@ -4,6 +4,13 @@ import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { UpstreamError } from "./server/cache";
+import { getStates, getDistricts, getSubdistricts, getVillages, getSnapshotInfo } from "./server/locations";
+import { lookupSoil } from "./server/soilHealth";
+import { getMandiPrices, getPriceHistory, MandiConfigError, MandiRateLimitError } from "./server/mandi";
+import { syncSnapshot } from "./server/marketSnapshot";
+import { SEASONS, cleanText } from "./server/cropInput";
+import { AiError, classifyAiError, errorBody, generateCropPlan } from "./server/cropPlan";
 
 dotenv.config();
 
@@ -26,60 +33,88 @@ const ai = new GoogleGenAI({
   },
 });
 
-// AI Helper with Multi-Model Fallback
-async function generateAIContent(prompt: string, schema: any, imagePart?: any) {
-  // Use explicit models/ prefix and include latest aliases for maximum compatibility
-  const models = [
-    "gemini-3.6-flash",
-    "gemini-3.1-pro-preview",
-    "gemini-3.1-flash-lite"
-  ];
-  let lastError = null;
+// Models are tried in order; override with GEMINI_MODELS="model-a,model-b".
+const GEMINI_MODELS = (process.env.GEMINI_MODELS || "gemini-3.6-flash,gemini-3.5-flash,gemini-3.1-flash-lite")
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
 
-  for (const model of models) {
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new AiError("AI_TIMEOUT", `Gemini did not respond within ${ms / 1000} s`)), ms);
+    }),
+  ]);
+}
+
+// The Gemini quota is shared by every page. After any quota error, background pages (dashboard,
+// market pulse, chat), which have their own fallback data, stop calling Gemini for 5 minutes so
+// requests the farmer explicitly makes (crop plan, plant diagnosis) are not starved.
+const BACKGROUND_COOLDOWN_MS = 5 * 60 * 1000;
+let backgroundCooldownUntil = 0;
+type AiPriority = "user" | "background";
+
+// Calls Gemini with JSON output, trying the next model on quota / unavailable errors.
+// Returns the parsed JSON and the model that produced it; throws on failure.
+async function generateJson(
+  prompt: string,
+  schema: any,
+  opts: { imagePart?: any; grounding?: boolean; timeoutMs?: number; deadlineMs?: number; priority?: AiPriority } = {},
+): Promise<{ data: any; model: string }> {
+  if (!process.env.GEMINI_API_KEY) throw new AiError("AI_NOT_CONFIGURED", "GEMINI_API_KEY is not configured on the server");
+  if (opts.priority !== "user" && Date.now() < backgroundCooldownUntil) {
+    throw new AiError("AI_QUOTA", "Skipping Gemini for this background page to save quota");
+  }
+  const deadline = Date.now() + (opts.deadlineMs ?? 100000);
+  let lastError: unknown = null;
+
+  for (const model of GEMINI_MODELS) {
+    const remaining = deadline - Date.now();
+    if (remaining < 5000) {
+      lastError = new AiError("AI_TIMEOUT", "Gemini did not respond in time");
+      break;
+    }
     try {
       const parts: any[] = [{ text: prompt }];
-      if (imagePart) parts.push(imagePart);
+      if (opts.imagePart) parts.push(opts.imagePart);
 
-      const response = await ai.models.generateContent({
-        model: model,
-        contents: { role: "user", parts },
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: schema,
-          tools: [{ googleSearch: {} }],
-        }
-      });
-      
-      if (response && response.text) {
-        return JSON.parse(response.text);
+      const response = await withTimeout(
+        ai.models.generateContent({
+          model,
+          contents: { role: "user", parts },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: schema,
+            ...(opts.grounding === false ? {} : { tools: [{ googleSearch: {} }] }),
+          },
+        }),
+        Math.min(opts.timeoutMs ?? 40000, remaining),
+      );
+
+      if (!response?.text) throw new AiError("AI_INVALID_RESPONSE", "Empty response from Gemini");
+      try {
+        return { data: JSON.parse(response.text), model };
+      } catch {
+        throw new AiError("AI_INVALID_RESPONSE", "Gemini returned text that is not valid JSON");
       }
-      throw new Error("Empty response from AI");
     } catch (e: any) {
       lastError = e;
-      const errorMsg = (e.message || (e.error && e.error.message) || String(e)).toLowerCase();
-      console.warn(`Model ${model} failed:`, errorMsg);
-      
-      // Try next model if quota (429), not found (404), or permission error
-      if (
-        errorMsg.includes("429") || 
-        errorMsg.includes("404") || 
-        errorMsg.includes("quota") || 
-        errorMsg.includes("not_found") ||
-        errorMsg.includes("exhausted") ||
-        errorMsg.includes("limit") ||
-        errorMsg.includes("permission")
-      ) {
-        if (errorMsg.includes("429")) {
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-        continue;
-      }
-      // For other critical errors (like invalid key), stop and throw
+      const code = classifyAiError(e);
+      console.warn(`Model ${model} failed (${code}):`, String(e?.message ?? e).slice(0, 300));
+      // Another model may still work for quota / missing-model problems; auth and timeouts won't improve.
+      if (code === "AI_QUOTA") backgroundCooldownUntil = Date.now() + BACKGROUND_COOLDOWN_MS;
+      if (code === "AI_QUOTA" || code === "AI_MODEL_UNAVAILABLE") continue;
       throw e;
     }
   }
-  throw lastError || new Error("All AI models failed or quota exceeded");
+  throw lastError || new AiError("AI_MODEL_UNAVAILABLE", "No Gemini model is configured");
+}
+
+// Used by the dashboard, diagnostics, market and chat endpoints.
+async function generateAIContent(prompt: string, schema: any, imagePart?: any, priority: AiPriority = "background") {
+  return (await generateJson(prompt, schema, { imagePart, priority })).data;
 }
 
 // Fallback data for regions to handle quota exhaustion gracefully
@@ -528,394 +563,6 @@ const FALLBACK_STATS: Record<string, any> = {
   }
 };
 
-// Fallback data for crop recommendations when AI is unavailable
-const FALLBACK_CROPS: Record<string, any> = {
-  "Punjab": {
-    "Spring": { cropName: "Wheat", expectedYield: 2100, estimatedInvestment: 15000, expectedRevenue: 45000, profitPercentage: 200, rationale: "Optimal temperature and irrigation availability in Punjab for winter wheat.", requirements: { water: "Moderate", fertilizer: "Urea, DAP", sunlight: "Full Sun", temperature: "15°C - 25°C" }, alternatives: [{ cropName: "Mustard", expectedYield: 800, rationale: "Low water requirement alternative." }] },
-    "Summer": { cropName: "Moong Dal", expectedYield: 400, estimatedInvestment: 8000, expectedRevenue: 24000, profitPercentage: 200, rationale: "Short duration pulse to improve soil nitrogen.", requirements: { water: "Low", fertilizer: "Minimal", sunlight: "Full", temperature: "25°C - 40°C" }, alternatives: [{ cropName: "Cucumber", expectedYield: 3000, rationale: "High demand summer vegetable." }] },
-    "Autumn": { cropName: "Paddy (Basmati)", expectedYield: 2500, estimatedInvestment: 25000, expectedRevenue: 75000, profitPercentage: 200, rationale: "Traditional high-value crop for the harvest season.", requirements: { water: "High", fertilizer: "Nitrogen rich", sunlight: "Direct", temperature: "25°C - 35°C" }, alternatives: [{ cropName: "Maize", expectedYield: 1500, rationale: "Good for well-drained soil." }] },
-    "Winter": { cropName: "Fodder Crops", expectedYield: 5000, estimatedInvestment: 5000, expectedRevenue: 15000, profitPercentage: 200, rationale: "Year-round demand for livestock.", requirements: { water: "Consistent", fertilizer: "Standard", sunlight: "Partial", temperature: "10°C - 40°C" }, alternatives: [{ cropName: "Herbs", expectedYield: 200, rationale: "Small scale continuous production." }] }
-  },
-  "Maharashtra": {
-    "Spring": { cropName: "Soybean", expectedYield: 1200, estimatedInvestment: 12000, expectedRevenue: 36000, profitPercentage: 200, rationale: "Best suited for black cotton soil during early cycles.", requirements: { water: "Moderate", fertilizer: "P & K rich", sunlight: "Direct", temperature: "20°C - 30°C" }, alternatives: [{ cropName: "Cotton", expectedYield: 800, rationale: "High commercial value." }] },
-    "Summer": { cropName: "Watermelon", expectedYield: 15000, estimatedInvestment: 40000, expectedRevenue: 120000, profitPercentage: 200, rationale: "High profit summer fruit for dry regions.", requirements: { water: "Moderate (Drip)", fertilizer: "NPK", sunlight: "Intense", temperature: "25°C - 45°C" }, alternatives: [{ cropName: "Groundnut", expectedYield: 1100, rationale: "Soil health improver." }] },
-    "Autumn": { cropName: "Onion", expectedYield: 12000, estimatedInvestment: 35000, expectedRevenue: 105000, profitPercentage: 200, rationale: "Stable demand and suitable climate.", requirements: { water: "Moderate", fertilizer: "Potassium", sunlight: "Partial", temperature: "18°C - 30°C" }, alternatives: [{ cropName: "Garlic", expectedYield: 5000, rationale: "High value spice." }] },
-    "Winter": { cropName: "Jowar (Sorghum)", expectedYield: 900, estimatedInvestment: 7000, expectedRevenue: 21000, profitPercentage: 200, rationale: "Drought resistant and stable yield for the region.", requirements: { water: "Low", fertilizer: "Moderate", sunlight: "Full", temperature: "20°C - 32°C" }, alternatives: [{ cropName: "Gram (Chana)", expectedYield: 700, rationale: "Excellent for residual moisture." }] }
-  },
-  "Tamil Nadu": {
-    "Spring": { cropName: "Paddy", expectedYield: 2800, estimatedInvestment: 22000, expectedRevenue: 66000, profitPercentage: 200, rationale: "Primary staple with high irrigation support.", requirements: { water: "High", fertilizer: "Standard", sunlight: "Direct", temperature: "25°C - 35°C" }, alternatives: [{ cropName: "Turmeric", expectedYield: 2500, rationale: "High value long-term crop." }] },
-    "Summer": { cropName: "Ragi (Finger Millet)", expectedYield: 1100, estimatedInvestment: 9000, expectedRevenue: 27000, profitPercentage: 200, rationale: "Drought hardy and nutritionally dense.", requirements: { water: "Very Low", fertilizer: "Organic", sunlight: "Full", temperature: "25°C - 35°C" }, alternatives: [{ cropName: "Vegetables", expectedYield: 4000, rationale: "Short cycle cash crops." }] },
-    "Autumn": { cropName: "Cotton", expectedYield: 1200, estimatedInvestment: 18000, expectedRevenue: 54000, profitPercentage: 200, rationale: "Suited for late season sowing.", requirements: { water: "Moderate", fertilizer: "NPK", sunlight: "Full", temperature: "22°C - 32°C" }, alternatives: [{ cropName: "Pulses", expectedYield: 500, rationale: "Soil health focus." }] },
-    "Winter": { cropName: "Maize", expectedYield: 3200, estimatedInvestment: 15000, expectedRevenue: 45000, profitPercentage: 200, rationale: "Ideal climate and stable market prices.", requirements: { water: "Moderate", fertilizer: "Nitrogen rich", sunlight: "Full", temperature: "20°C - 30°C" }, alternatives: [{ cropName: "Black Gram", expectedYield: 600, rationale: "Good for soil replenishment." }] }
-  },
-  "Arunachal Pradesh": {
-    "Spring": { cropName: "Ginger", expectedYield: 6000, estimatedInvestment: 50000, expectedRevenue: 150000, profitPercentage: 200, rationale: "High humidity and slope drainage favor high-quality ginger.", requirements: { water: "High", fertilizer: "Organic Mulch", sunlight: "Partial Shade", temperature: "20°C - 30°C" }, alternatives: [{ cropName: "Large Cardamom", expectedYield: 500, rationale: "Premium spice for hill slopes." }] },
-    "Summer": { cropName: "Pineapple", expectedYield: 12000, estimatedInvestment: 45000, expectedRevenue: 135000, profitPercentage: 200, rationale: "Tropical climate support for sweet varieties.", requirements: { water: "Moderate", fertilizer: "Potassium rich", sunlight: "Full", temperature: "22°C - 32°C" }, alternatives: [{ cropName: "Passion Fruit", expectedYield: 4000, rationale: "Emerging high-value fruit." }] },
-    "Autumn": { cropName: "Apples", expectedYield: 10000, estimatedInvestment: 60000, expectedRevenue: 180000, profitPercentage: 200, rationale: "High altitude temperate fruit.", requirements: { water: "Moderate", fertilizer: "Balanced", sunlight: "Full", temperature: "10°C - 25°C" }, alternatives: [{ cropName: "Pears", expectedYield: 8000, rationale: "Cold-tolerant alternative." }] },
-    "Winter": { cropName: "Mustard", expectedYield: 750, estimatedInvestment: 10000, expectedRevenue: 30000, profitPercentage: 200, rationale: "Excellent winter crop for hill terraces.", requirements: { water: "Low", fertilizer: "Moderate", sunlight: "Full", temperature: "15°C - 25°C" }, alternatives: [{ cropName: "Buckwheat", expectedYield: 900, rationale: "Traditional cold-hardy grain." }] }
-  },
-  "Uttar Pradesh": {
-    "Spring": { cropName: "Sugarcane", expectedYield: 35000, estimatedInvestment: 60000, expectedRevenue: 180000, profitPercentage: 200, rationale: "Traditional belt with excellent irrigation and factory support.", requirements: { water: "Very High", fertilizer: "Heavy NPK", sunlight: "Direct", temperature: "25°C - 38°C" }, alternatives: [{ cropName: "Paddy", expectedYield: 2600, rationale: "Secondary staple for monsoon." }] },
-    "Summer": { cropName: "Mentha (Mint)", expectedYield: 80, estimatedInvestment: 15000, expectedRevenue: 45000, profitPercentage: 200, rationale: "UP is the global leader in mentha production.", requirements: { water: "High (Frequent)", fertilizer: "Nitrogen", sunlight: "Full", temperature: "30°C - 45°C" }, alternatives: [{ cropName: "Moong", expectedYield: 500, rationale: "Pulse for soil recovery." }] },
-    "Autumn": { cropName: "Mustard", expectedYield: 1200, estimatedInvestment: 12000, expectedRevenue: 36000, profitPercentage: 200, rationale: "Good for early winter sowing.", requirements: { water: "Low", fertilizer: "Standard", sunlight: "Full", temperature: "15°C - 30°C" }, alternatives: [{ cropName: "Peas", expectedYield: 2000, rationale: "High demand vegetable." }] },
-    "Winter": { cropName: "Wheat", expectedYield: 2400, estimatedInvestment: 16000, expectedRevenue: 48000, profitPercentage: 200, rationale: "Core wheat-growing region with favorable winter frost.", requirements: { water: "Moderate", fertilizer: "Urea, DAP", sunlight: "Full", temperature: "10°C - 25°C" }, alternatives: [{ cropName: "Potato", expectedYield: 12000, rationale: "High value cash crop." }] }
-  },
-  "Karnataka": {
-    "Spring": { cropName: "Maize", expectedYield: 2800, estimatedInvestment: 18000, expectedRevenue: 54000, profitPercentage: 200, rationale: "Ideal rainfall distribution and soil types in central Karnataka.", requirements: { water: "Moderate", fertilizer: "Standard NPK", sunlight: "Direct", temperature: "22°C - 32°C" }, alternatives: [{ cropName: "Ragi", expectedYield: 1500, rationale: "Nutritional staple for dry belts." }] },
-    "Summer": { cropName: "Sunflower", expectedYield: 900, estimatedInvestment: 14000, expectedRevenue: 42000, profitPercentage: 200, rationale: "Well-suited for the summer heat and managed irrigation.", requirements: { water: "Moderate", fertilizer: "NPK", sunlight: "Full", temperature: "25°C - 38°C" }, alternatives: [{ cropName: "Cowpea", expectedYield: 600, rationale: "Short cycle pulse." }] },
-    "Autumn": { cropName: "Chilli", expectedYield: 1500, estimatedInvestment: 30000, expectedRevenue: 90000, profitPercentage: 200, rationale: "Ideal for the late season heat.", requirements: { water: "Moderate", fertilizer: "Potassium", sunlight: "Full", temperature: "20°C - 35°C" }, alternatives: [{ cropName: "Ginger", expectedYield: 5000, rationale: "Shade tolerant spice." }] },
-    "Winter": { cropName: "Bengal Gram", expectedYield: 850, estimatedInvestment: 10000, expectedRevenue: 30000, profitPercentage: 200, rationale: "Thrives on black soil residual moisture.", requirements: { water: "Low", fertilizer: "Phosphate", sunlight: "Full", temperature: "18°C - 28°C" }, alternatives: [{ cropName: "Jowar", expectedYield: 1200, rationale: "Stable fodder and grain crop." }] }
-  },
-  "West Bengal": {
-    "Spring": { cropName: "Jute", expectedYield: 1800, estimatedInvestment: 20000, expectedRevenue: 60000, profitPercentage: 200, rationale: "Deltaic soil and high rainfall are perfect for fiber quality.", requirements: { water: "Very High", fertilizer: "Organic + Urea", sunlight: "Direct", temperature: "25°C - 35°C" }, alternatives: [{ cropName: "Aman Rice", expectedYield: 2500, rationale: "Primary monsoon crop." }] },
-    "Summer": { cropName: "Sesame", expectedYield: 700, estimatedInvestment: 12000, expectedRevenue: 36000, profitPercentage: 200, rationale: "Heat tolerant oilseed for summer fallows.", requirements: { water: "Low", fertilizer: "Moderate", sunlight: "Full", temperature: "28°C - 40°C" }, alternatives: [{ cropName: "Vegetables", expectedYield: 4500, rationale: "Stable income source." }] },
-    "Autumn": { cropName: "Potato", expectedYield: 15000, estimatedInvestment: 40000, expectedRevenue: 120000, profitPercentage: 200, rationale: "Major producer with cool season support.", requirements: { water: "Moderate", fertilizer: "Balanced", sunlight: "Full", temperature: "15°C - 25°C" }, alternatives: [{ cropName: "Cabbage", expectedYield: 20000, rationale: "Winter vegetable staple." }] },
-    "Winter": { cropName: "Boro Rice", expectedYield: 3200, estimatedInvestment: 28000, expectedRevenue: 84000, profitPercentage: 200, rationale: "High yields with winter irrigation.", requirements: { water: "High", fertilizer: "Balanced", sunlight: "Full", temperature: "20°C - 30°C" }, alternatives: [{ cropName: "Mustard", expectedYield: 900, rationale: "Short duration oilseed." }] }
-  },
-  default: {
-    "Spring": { cropName: "Paddy", expectedYield: 2400, estimatedInvestment: 20000, expectedRevenue: 60000, profitPercentage: 200, rationale: "Standard monsoon staple.", requirements: { water: "High", fertilizer: "NPK", sunlight: "Direct", temperature: "22°C - 35°C" }, alternatives: [{ cropName: "Maize", expectedYield: 1800, rationale: "Reliable alternative." }] },
-    "Summer": { cropName: "Moong", expectedYield: 450, estimatedInvestment: 10000, expectedRevenue: 30000, profitPercentage: 200, rationale: "Soil-friendly summer pulse.", requirements: { water: "Low", fertilizer: "Minimal", sunlight: "High", temperature: "25°C - 40°C" }, alternatives: [{ cropName: "Vegetables", expectedYield: 3500, rationale: "Quick turnaround crops." }] },
-    "Autumn": { cropName: "Millets", expectedYield: 1200, estimatedInvestment: 8000, expectedRevenue: 24000, profitPercentage: 200, rationale: "Resilient crops for transitional periods.", requirements: { water: "Low", fertilizer: "Minimal", sunlight: "Full", temperature: "20°C - 35°C" }, alternatives: [{ cropName: "Oilseeds", expectedYield: 800, rationale: "Short cycle income." }] },
-    "Winter": { cropName: "Wheat", expectedYield: 2000, estimatedInvestment: 15000, expectedRevenue: 45000, profitPercentage: 200, rationale: "Standard winter cereal.", requirements: { water: "Moderate", fertilizer: "Nitrogen", sunlight: "Full", temperature: "15°C - 25°C" }, alternatives: [{ cropName: "Gram", expectedYield: 700, rationale: "Low water requirement." }] }
-  }
-};
-
-const FALLBACK_MARKET: Record<string, any> = {
-  "Maharashtra": {
-    topChangingCrops: [
-      { crop: "Cotton", change: 4.2, trend: "up" },
-      { crop: "Soybean", change: 1.5, trend: "up" },
-      { crop: "Onion", change: -8.4, trend: "down" }
-    ],
-    marketSentiment: "Optimistic",
-    advisorTip: "Market prices for pulses are rising; consider storing for peak season."
-  },
-  "Punjab": {
-    topChangingCrops: [
-      { crop: "Wheat", change: 5.1, trend: "up" },
-      { crop: "Rice", change: 2.3, trend: "up" },
-      { crop: "Mustard", change: 1.8, trend: "steady" }
-    ],
-    marketSentiment: "Bullish",
-    advisorTip: "Expect high demand for premium Basmati varieties this month."
-  },
-  "Karnataka": {
-    topChangingCrops: [
-      { crop: "Coffee", change: 6.8, trend: "up" },
-      { crop: "Ragi", change: 0.5, trend: "steady" },
-      { crop: "Areca Nut", change: -2.1, trend: "down" }
-    ],
-    marketSentiment: "Cautious",
-    advisorTip: "Focus on water-efficient crops as reservoir levels are lower than average."
-  },
-  "Tamil Nadu": {
-    topChangingCrops: [
-      { crop: "Banana", change: 3.5, trend: "up" },
-      { crop: "Paddy", change: 1.2, trend: "steady" },
-      { crop: "Turmeric", change: 5.9, trend: "up" }
-    ],
-    marketSentiment: "Stable",
-    advisorTip: "Favorable conditions for spice cultivation in western regions."
-  },
-  "Uttar Pradesh": {
-    topChangingCrops: [
-      { crop: "Sugarcane", change: 4.8, trend: "up" },
-      { crop: "Wheat", change: 2.1, trend: "up" },
-      { crop: "Potato", change: -1.5, trend: "down" }
-    ],
-    marketSentiment: "Strong",
-    advisorTip: "Sugarcane mills are offering better procurement rates this season."
-  },
-  "Gujarat": {
-    topChangingCrops: [
-      { crop: "Cotton", change: 3.2, trend: "up" },
-      { crop: "Groundnut", change: 5.5, trend: "up" },
-      { crop: "Cumin", change: 12.4, trend: "up" }
-    ],
-    marketSentiment: "Very Bullish",
-    advisorTip: "Spices market is seeing record highs; excellent time for sales."
-  },
-  "Andhra Pradesh": {
-    topChangingCrops: [
-      { crop: "Chilli", change: 7.2, trend: "up" },
-      { crop: "Paddy", change: 1.1, trend: "steady" },
-      { crop: "Tobacco", change: -3.4, trend: "down" }
-    ],
-    marketSentiment: "Mixed",
-    advisorTip: "High international demand for Guntur Chillies is boosting local prices."
-  },
-  "West Bengal": {
-    topChangingCrops: [
-      { crop: "Jute", change: 4.5, trend: "up" },
-      { crop: "Rice", change: 1.8, trend: "up" },
-      { crop: "Fish", change: 2.9, trend: "up" }
-    ],
-    marketSentiment: "Positive",
-    advisorTip: "Early monsoon signs are favorable for the next Jute sowing cycle."
-  },
-  "Rajasthan": {
-    topChangingCrops: [
-      { crop: "Bajra", change: 2.1, trend: "steady" },
-      { crop: "Mustard", change: 6.4, trend: "up" },
-      { crop: "Guar", change: -4.2, trend: "down" }
-    ],
-    marketSentiment: "Steady",
-    advisorTip: "Mustard oil seeds are fetching premium prices due to low national stock."
-  },
-  "Bihar": {
-    topChangingCrops: [
-      { crop: "Maize", change: 4.2, trend: "up" },
-      { crop: "Wheat", change: 1.5, trend: "up" },
-      { crop: "Litchi", change: 8.4, trend: "up" }
-    ],
-    marketSentiment: "Positive",
-    advisorTip: "High demand for winter maize in industrial sectors is driving prices."
-  },
-  "Madhya Pradesh": {
-    topChangingCrops: [
-      { crop: "Soybean", change: 3.8, trend: "up" },
-      { crop: "Wheat", change: 2.2, trend: "up" },
-      { crop: "Garlic", change: 15.4, trend: "up" }
-    ],
-    marketSentiment: "Strong",
-    advisorTip: "Garlic prices are hitting multi-year highs; liquidate stocks soon."
-  },
-  "Haryana": {
-    topChangingCrops: [
-      { crop: "Wheat", change: 4.5, trend: "up" },
-      { crop: "Mustard", change: 3.2, trend: "up" },
-      { crop: "Basmati Rice", change: 5.8, trend: "up" }
-    ],
-    marketSentiment: "Bullish",
-    advisorTip: "Export demand for Basmati remains strong; hold for better rates if possible."
-  },
-  "Kerala": {
-    topChangingCrops: [
-      { crop: "Rubber", change: -2.1, trend: "down" },
-      { crop: "Pepper", change: 4.5, trend: "up" },
-      { crop: "Cardamom", change: 6.2, trend: "up" }
-    ],
-    marketSentiment: "Spiced",
-    advisorTip: "Spice auctions are seeing higher volumes; quality produce is fetching premiums."
-  },
-  "Telangana": {
-    topChangingCrops: [
-      { crop: "Cotton", change: 3.5, trend: "up" },
-      { crop: "Paddy", change: 1.2, trend: "steady" },
-      { crop: "Chilli", change: 8.9, trend: "up" }
-    ],
-    marketSentiment: "Optimistic",
-    advisorTip: "Chilli markets in Warangal are seeing record arrivals and strong prices."
-  },
-  "Odisha": {
-    topChangingCrops: [
-      { crop: "Paddy", change: 2.4, trend: "up" },
-      { crop: "Moong", change: 1.8, trend: "up" },
-      { crop: "Groundnut", change: -1.2, trend: "down" }
-    ],
-    marketSentiment: "Stable",
-    advisorTip: "Government procurement centers (Mandis) are now fully operational for Kharif crop."
-  },
-  "Assam": {
-    topChangingCrops: [
-      { crop: "Tea", change: 5.4, trend: "up" },
-      { crop: "Jute", change: 2.1, trend: "up" },
-      { crop: "Areca Nut", change: 1.5, trend: "steady" }
-    ],
-    marketSentiment: "Positive",
-    advisorTip: "Global tea demand for CTC varieties is supporting local auction prices."
-  },
-  "Jammu and Kashmir": {
-    topChangingCrops: [
-      { crop: "Apple", change: 12.5, trend: "up" },
-      { crop: "Saffron", change: 4.2, trend: "up" },
-      { crop: "Walnut", change: 1.8, trend: "steady" }
-    ],
-    marketSentiment: "Very Strong",
-    advisorTip: "Apple harvest season is peak; logistics are improving, leading to better farm-gate prices."
-  },
-  "Chhattisgarh": {
-    topChangingCrops: [
-      { crop: "Paddy", change: 3.1, trend: "up" },
-      { crop: "Maize", change: 1.5, trend: "steady" },
-      { crop: "Linseed", change: 2.4, trend: "up" }
-    ],
-    marketSentiment: "Stable",
-    advisorTip: "Bonus payments on Paddy procurement are boosting farmer sentiment."
-  },
-  "Jharkhand": {
-    topChangingCrops: [
-      { crop: "Rice", change: 1.8, trend: "steady" },
-      { crop: "Tomato", change: -15.4, trend: "down" },
-      { crop: "Potato", change: 2.1, trend: "up" }
-    ],
-    marketSentiment: "Mixed",
-    advisorTip: "Vegetable prices are cooling down; consider focusing on Rabi pulses."
-  },
-  "Uttarakhand": {
-    topChangingCrops: [
-      { crop: "Basmati Rice", change: 4.5, trend: "up" },
-      { crop: "Mandua (Ragi)", change: 3.2, trend: "up" },
-      { crop: "Soybean", change: 1.1, trend: "steady" }
-    ],
-    marketSentiment: "Optimistic",
-    advisorTip: "Promotion of organic millets is opening up premium niche markets."
-  },
-  "Himachal Pradesh": {
-    topChangingCrops: [
-      { crop: "Apple", change: 8.4, trend: "up" },
-      { crop: "Potato", change: 2.5, trend: "up" },
-      { crop: "Stone Fruits", change: -1.2, trend: "down" }
-    ],
-    marketSentiment: "Positive",
-    advisorTip: "Off-season vegetable cultivation in higher altitudes is fetching high returns."
-  },
-  "Goa": {
-    topChangingCrops: [
-      { crop: "Cashew", change: 5.2, trend: "up" },
-      { crop: "Coconut", change: 1.5, trend: "steady" },
-      { crop: "Areca Nut", change: 2.4, trend: "up" }
-    ],
-    marketSentiment: "Stable",
-    advisorTip: "Cashew processing units are active; ensure proper drying before sale."
-  },
-  "Delhi": {
-    topChangingCrops: [
-      { crop: "Vegetables", change: 4.5, trend: "up" },
-      { crop: "Flowers", change: 12.1, trend: "up" },
-      { crop: "Wheat", change: 0.5, trend: "steady" }
-    ],
-    marketSentiment: "Active",
-    advisorTip: "High demand in urban markets for organic leafy greens and decorative flowers."
-  },
-  "Arunachal Pradesh": {
-    topChangingCrops: [
-      { crop: "Kiwi", change: 15.2, trend: "up" },
-      { crop: "Orange", change: 4.5, trend: "up" },
-      { crop: "Large Cardamom", change: 6.8, trend: "up" }
-    ],
-    marketSentiment: "Bullish",
-    advisorTip: "Kiwi exports are gaining momentum; focus on grading and packaging for premium markets."
-  },
-  "Manipur": {
-    topChangingCrops: [
-      { crop: "Black Rice", change: 12.4, trend: "up" },
-      { crop: "Pineapple", change: 3.5, trend: "up" },
-      { crop: "Ginger", change: 5.1, trend: "up" }
-    ],
-    marketSentiment: "Positive",
-    advisorTip: "GI-tagged Black Rice (Chak-Hao) is seeing high demand from organic retailers."
-  },
-  "Meghalaya": {
-    topChangingCrops: [
-      { crop: "Lakadong Turmeric", change: 18.5, trend: "up" },
-      { crop: "Ginger", change: 4.2, trend: "up" },
-      { crop: "Strawberry", change: 10.4, trend: "up" }
-    ],
-    marketSentiment: "Strong",
-    advisorTip: "Lakadong Turmeric's high curcumin content is fetching record prices globally."
-  },
-  "Mizoram": {
-    topChangingCrops: [
-      { crop: "Bird's Eye Chilli", change: 7.4, trend: "up" },
-      { crop: "Passion Fruit", change: 3.2, trend: "steady" },
-      { crop: "Banana", change: 1.5, trend: "steady" }
-    ],
-    marketSentiment: "Steady",
-    advisorTip: "Focus on value-added products like dried chillies for higher margins."
-  },
-  "Nagaland": {
-    topChangingCrops: [
-      { crop: "Naga King Chilli", change: 10.5, trend: "up" },
-      { crop: "Pineapple", change: 4.8, trend: "up" },
-      { crop: "Coffee", change: 5.2, trend: "up" }
-    ],
-    marketSentiment: "Optimistic",
-    advisorTip: "Naga Mircha demand is rising; ensure proper certification for export batches."
-  },
-  "Sikkim": {
-    topChangingCrops: [
-      { crop: "Large Cardamom", change: 8.2, trend: "up" },
-      { crop: "Ginger", change: 5.4, trend: "up" },
-      { crop: "Buckwheat", change: 4.1, trend: "steady" }
-    ],
-    marketSentiment: "Bullish",
-    advisorTip: "100% organic status is your biggest asset; target direct-to-consumer health brands."
-  },
-  "Tripura": {
-    topChangingCrops: [
-      { crop: "Rubber", change: 3.5, trend: "up" },
-      { crop: "Pineapple (Queen)", change: 6.8, trend: "up" },
-      { crop: "Jackfruit", change: 2.1, trend: "steady" }
-    ],
-    marketSentiment: "Stable",
-    advisorTip: "Queen Pineapple season is starting; local processing units are ready for procurement."
-  },
-  "Ladakh": {
-    topChangingCrops: [
-      { crop: "Apricot", change: 14.2, trend: "up" },
-      { crop: "Sea Buckthorn", change: 11.5, trend: "up" },
-      { crop: "Barley", change: 1.2, trend: "steady" }
-    ],
-    marketSentiment: "Strong",
-    advisorTip: "Raktsey Karpo apricots are seeing massive demand; ensure sun-drying meets quality standards."
-  },
-  "Andaman and Nicobar Islands": {
-    topChangingCrops: [
-      { crop: "Coconut", change: 3.2, trend: "up" },
-      { crop: "Areca Nut", change: 4.5, trend: "up" },
-      { crop: "Black Pepper", change: 2.8, trend: "steady" }
-    ],
-    marketSentiment: "Positive",
-    advisorTip: "Copra prices are stable; consider intercropping with spices for better risk management."
-  },
-  "Puducherry": {
-    topChangingCrops: [
-      { crop: "Paddy", change: 1.5, trend: "steady" },
-      { crop: "Sugarcane", change: 3.2, trend: "up" },
-      { crop: "Groundnut", change: 2.4, trend: "up" }
-    ],
-    marketSentiment: "Steady",
-    advisorTip: "Monitor soil salinity levels closely, especially in coastal farm plots."
-  },
-  "Chandigarh": {
-    topChangingCrops: [
-      { crop: "Vegetables", change: 5.2, trend: "up" },
-      { crop: "Wheat", change: 1.8, trend: "steady" },
-      { crop: "Fruit Nursery", change: 4.5, trend: "up" }
-    ],
-    marketSentiment: "Positive",
-    advisorTip: "Urban gardening kits and nursery plants are a fast-growing market segment."
-  },
-  "Dadra and Nagar Haveli and Daman and Diu": {
-    topChangingCrops: [
-      { crop: "Rice", change: 1.2, trend: "steady" },
-      { crop: "Ragi", change: 2.5, trend: "up" },
-      { crop: "Coconut", change: 1.8, trend: "steady" }
-    ],
-    marketSentiment: "Stable",
-    advisorTip: "Focus on water management in coastal regions during dry spells."
-  },
-  "Lakshadweep": {
-    topChangingCrops: [
-      { crop: "Coconut", change: 4.1, trend: "up" },
-      { crop: "Tuna Fish", change: 6.5, trend: "up" },
-      { crop: "Coir Products", change: 2.2, trend: "steady" }
-    ],
-    marketSentiment: "Positive",
-    advisorTip: "Coconut production is stable; coir-based cottage industries are seeing good export demand."
-  },
-  default: {
-    topChangingCrops: [
-      { crop: "Paddy", change: 2.4, trend: "up" },
-      { crop: "Wheat", change: -1.2, trend: "down" },
-      { crop: "Mustard", change: 0.5, trend: "steady" }
-    ],
-    marketSentiment: "Bullish",
-    advisorTip: "Consider monitoring moisture levels as temperatures rise."
-  }
-};
-
 // Simple in-memory cache
 const cache: Record<string, { data: any; timestamp: number }> = {};
 const CACHE_TTL = 3600000; // 1 hour
@@ -932,6 +579,21 @@ function setCachedData(key: string, data: any) {
   cache[key] = { data, timestamp: Date.now() };
 }
 
+function parseCode(v: unknown): number | null {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 && n < 1e9 ? n : null;
+}
+
+function sendUpstreamError(res: express.Response, error: unknown, fallbackMessage: string) {
+  if (error instanceof UpstreamError) {
+    console.warn(`[${error.service}] ${error.message}`);
+    return res.status(error.status).json({ error: error.message, service: error.service });
+  }
+  console.error(fallbackMessage, error);
+  return res.status(500).json({ error: fallbackMessage });
+}
+
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -939,110 +601,68 @@ async function startServer() {
   // Body parser with higher limit for image uploads
   app.use(express.json({ limit: "10mb" }));
 
+  // Location hierarchy (LGD) and area soil-test data (Soil Health Card)
+  app.get("/api/locations/meta", (_req, res) => {
+    res.json(getSnapshotInfo() ?? { source: "Local Government Directory (LGD) live web service", sourceUrl: "https://lgdirectory.gov.in" });
+  });
+
+  app.get("/api/locations/states", async (_req, res) => {
+    try {
+      res.json(await getStates());
+    } catch (error) {
+      sendUpstreamError(res, error, "Failed to load states");
+    }
+  });
+
+  const locationRoute = (param: string, load: (code: number) => Promise<unknown>, label: string) =>
+    async (req: express.Request, res: express.Response) => {
+      const code = parseCode(req.query[param]);
+      if (!code) return res.status(400).json({ error: `A valid numeric ${param} is required` });
+      try {
+        res.json(await load(code));
+      } catch (error) {
+        sendUpstreamError(res, error, `Failed to load ${label}`);
+      }
+    };
+  app.get("/api/locations/districts", locationRoute("stateCode", getDistricts, "districts"));
+  app.get("/api/locations/subdistricts", locationRoute("districtCode", getSubdistricts, "sub-districts"));
+  app.get("/api/locations/villages", locationRoute("subdistrictCode", getVillages, "villages"));
+
+  app.get("/api/soil", async (req, res) => {
+    const stateCode = parseCode(req.query.stateCode);
+    const districtCode = parseCode(req.query.districtCode);
+    const villageCode = req.query.villageCode === undefined ? undefined : parseCode(req.query.villageCode);
+    if (!stateCode || !districtCode || villageCode === null) {
+      return res.status(400).json({ error: "stateCode and districtCode are required; villageCode must be numeric" });
+    }
+    try {
+      res.json(await lookupSoil({ stateCode, districtCode, villageCode: villageCode ?? undefined }));
+    } catch (error) {
+      sendUpstreamError(res, error, "Failed to load soil data");
+    }
+  });
+
   // AI API routes
   app.post("/api/ai/crop-recommendation", async (req, res) => {
+    const soilData = req.body?.soilData;
+    const region = cleanText(soilData?.region, 80);
+    const season = cleanText(soilData?.season, 20);
+    if (!region || !SEASONS.includes(season)) {
+      const { status, body } = errorBody("BAD_REQUEST", "A state and a valid season are required");
+      return res.status(status).json(body);
+    }
     try {
-      const { soilData } = req.body;
-      const { region, season } = soilData;
-      
-      const prompt = `As an expert agricultural scientist specialized in Indian agriculture, recommend the top 3 best crops based on these specific parameters:
-      Region/State: ${region}
-      Season: ${season} (Note: Spring, Summer, Autumn, or Winter)
-      Soil Nitrogen (N): ${soilData.n}
-      Soil Phosphorus (P): ${soilData.p}
-      Soil Potassium (K): ${soilData.k}
-      Soil pH: ${soilData.ph}
-
-      CRITICAL: The recommendations MUST be strictly suitable for the ${season} season in the state of ${region}. 
-      For example, if it is Summer in Rajasthan, do not recommend Paddy. 
-      If it is Winter in Punjab, Wheat or Mustard are expected.
-      If it is Spring in Karnataka, Ragi or Coffee related crops are expected.
-      
-      You MUST also provide financial estimates (Investment, Revenue, Profit) per acre for each recommended crop in Indian Rupees (INR).
-      
-      Provide the recommendations in a structured array format.`;
-
-      const schema = {
-        type: Type.OBJECT,
-        properties: {
-          recommendations: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                cropName: { type: Type.STRING },
-                confidence: { type: Type.NUMBER },
-                rationale: { type: Type.STRING },
-                expectedYield: { type: Type.NUMBER },
-                estimatedDuration: { type: Type.NUMBER },
-                estimatedInvestment: { type: Type.NUMBER, description: "Total cost to be invested per acre in INR" },
-                expectedRevenue: { type: Type.NUMBER, description: "Total expected revenue per acre in INR" },
-                profitPercentage: { type: Type.NUMBER, description: "Profit percentage calculated as ((Revenue - Investment) / Investment) * 100" },
-                requirements: {
-                  type: Type.OBJECT,
-                  properties: {
-                    water: { type: Type.STRING },
-                    fertilizer: { type: Type.STRING },
-                    sunlight: { type: Type.STRING },
-                    temperature: { type: Type.STRING },
-                  },
-                  required: ["water", "fertilizer", "sunlight", "temperature"],
-                },
-                pestRisk: { type: Type.STRING },
-                marketPotential: { type: Type.STRING },
-              },
-              required: ["cropName", "confidence", "rationale", "expectedYield", "requirements", "estimatedInvestment", "expectedRevenue", "profitPercentage"],
-            },
-          },
-        },
-        required: ["recommendations"],
-      };
-
-      const data = await generateAIContent(prompt, schema);
-      res.json(data.recommendations);
+      // Grounding is off: we ask for general agronomic guidance, not claims about current events,
+      // and some models reject search tools combined with a JSON response schema.
+      const plan = await generateCropPlan(soilData, (prompt, schema) =>
+        generateJson(prompt, schema, { grounding: false, timeoutMs: 45000, deadlineMs: 100000, priority: "user" }),
+      );
+      res.json(plan);
     } catch (error) {
-      console.error("AI Recommendation Error:", error);
-      const { region, season } = req.body.soilData;
-      
-      // Select best fallback based on state and season
-      const stateFallback = FALLBACK_CROPS[region] || FALLBACK_CROPS.default;
-      const seasonFallback = stateFallback[season] || stateFallback["Winter"];
-      
-      // Randomize fallback data slightly
-      const yieldVariation = Math.floor(Math.random() * 200 - 100);
-      
-      const mainRec = {
-        ...seasonFallback,
-        expectedYield: seasonFallback.expectedYield + yieldVariation,
-        estimatedInvestment: (seasonFallback.estimatedInvestment || 15000) + Math.floor(Math.random() * 2000 - 1000),
-        expectedRevenue: (seasonFallback.expectedRevenue || 45000) + Math.floor(Math.random() * 5000 - 2500),
-        profitPercentage: seasonFallback.profitPercentage || 200,
-        confidence: 70 + Math.floor(Math.random() * 10),
-        estimatedDuration: season === "Summer" ? 3 : 4,
-        pestRisk: Math.random() > 0.5 ? "Low" : "Moderate",
-        marketPotential: Math.random() > 0.7 ? "High" : "Stable"
-      };
-
-      const alts = (seasonFallback.alternatives || []).map((alt: any) => ({
-        cropName: alt.cropName,
-        confidence: 60 + Math.floor(Math.random() * 10),
-        rationale: alt.rationale,
-        expectedYield: alt.expectedYield,
-        estimatedDuration: 4,
-        estimatedInvestment: 12000,
-        expectedRevenue: 30000,
-        profitPercentage: 150,
-        requirements: {
-          water: "Moderate",
-          fertilizer: "Standard",
-          sunlight: "Full",
-          temperature: "20-30°C"
-        },
-        pestRisk: "Low",
-        marketPotential: "Stable"
-      }));
-
-      res.json([mainRec, ...alts]);
+      const code = classifyAiError(error);
+      console.error(`Crop recommendation failed (${code}):`, (error as any)?.message ?? error);
+      const { status, body } = errorBody(code, error instanceof AiError ? error.message : undefined);
+      res.status(status).json(body);
     }
   });
 
@@ -1079,7 +699,7 @@ async function startServer() {
       4. Provide diagnosis, confidence (0-100), and symptoms.
       5. Recommend detailed treatment.
       6. Provide a "Prevention" guide to stop this from happening again.
-      7. List "Recovery Steps" to overcome the current infection and restore plant health.`, schema, imagePart);
+      7. List "Recovery Steps" to overcome the current infection and restore plant health.`, schema, imagePart, "user");
       res.json(data);
     } catch (error) {
       console.error("AI Disease Analysis Error:", error);
@@ -1119,44 +739,112 @@ async function startServer() {
     }
   });
 
-  app.post("/api/ai/market-pulse", async (req, res) => {
-    const { region } = req.body;
-    const cleanRegion = region?.trim() || "default";
+  // Live mandi prices (AGMARKNET via data.gov.in)
+  app.get("/api/market/prices", async (req, res) => {
+    const state = cleanText(req.query.state, 80);
+    if (!state) return res.status(400).json({ error: "state is required", code: "BAD_REQUEST" });
     try {
-      const cacheKey = `market-pulse-${cleanRegion}`;
-      const cached = getCachedData(cacheKey);
-      if (cached) return res.json(cached);
-      
-      const prompt = `Provide a brief analysis of current agricultural market trends in ${cleanRegion} as of ${new Date().toLocaleDateString('en-IN')}.`;
+      res.json(await getMandiPrices(state));
+    } catch (error) {
+      if (error instanceof MandiConfigError) {
+        return res.status(503).json({ error: error.message, code: "NOT_CONFIGURED", reason: error.reason, keylessStates: error.keylessStates });
+      }
+      if (error instanceof MandiRateLimitError) {
+        return res.status(503).json({ error: error.message, code: "RATE_LIMITED", service: error.service, retryAfterSec: error.retryAfterSec });
+      }
+      if (error instanceof UpstreamError) {
+        const code = error.status === 503 ? "RATE_LIMITED" : /rejected/.test(error.message) ? "KEY_REJECTED" : "UPSTREAM";
+        console.warn(`[${error.service}] ${error.message}`);
+        return res.status(error.status).json({ error: error.message, code });
+      }
+      console.error("Mandi prices error:", error);
+      res.status(500).json({ error: "Failed to load mandi prices", code: "UPSTREAM" });
+    }
+  });
 
-      const schema = {
-        type: Type.OBJECT,
-        properties: {
-          topChangingCrops: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                crop: { type: Type.STRING },
-                change: { type: Type.NUMBER },
-                trend: { type: Type.STRING, enum: ["up", "down", "steady"] }
-              },
-              required: ["crop", "change", "trend"]
-            }
+  app.get("/api/market/history", async (req, res) => {
+    const state = cleanText(req.query.state, 80);
+    const commodity = cleanText(req.query.commodity, 80);
+    if (!state || !commodity) return res.status(400).json({ error: "state and commodity are required", code: "BAD_REQUEST" });
+    try {
+      res.json({ state, commodity, points: await getPriceHistory(state, commodity, cleanText(req.query.to, 10) || undefined, cleanText(req.query.provider, 20) || undefined) });
+    } catch (error) {
+      console.warn("Price history unavailable:", (error as any)?.message ?? error);
+      res.status(502).json({ error: "Price history is unavailable", code: "UPSTREAM" });
+    }
+  });
+
+  // AI commentary on the state's market. When live mandi data is available it is the only basis
+  // for price statements; the model is told not to invent prices or percentage changes.
+  app.post("/api/ai/market-pulse", async (req, res) => {
+    const region = cleanText(req.body?.region, 80);
+    if (!region) return res.status(400).json({ error: "region is required", code: "BAD_REQUEST" });
+    const cacheKey = `market-pulse-v2-${region}`;
+    const hit = getCachedData(cacheKey);
+    if (hit) return res.json(hit);
+
+    let mandi: Awaited<ReturnType<typeof getMandiPrices>> | null = null;
+    try {
+      mandi = await getMandiPrices(region);
+    } catch {
+      mandi = null; // commentary can still be general guidance
+    }
+    const priceLines =
+      mandi?.status === "ok"
+        ? mandi.commodities
+            .slice(0, 25)
+            .map((c) => `${c.commodity}: median modal Rs.${c.medianModal}/quintal across ${c.markets} market(s), range Rs.${c.minPrice}-${c.maxPrice} (arrivals up to ${c.latestDate})`)
+            .join("\n")
+        : "";
+    const basis = priceLines ? "mandi_data" : "general_guidance";
+
+    const prompt = priceLines
+      ? `You are an agricultural market analyst. Below are today's AGMARKNET mandi prices for ${region}, India.
+${priceLines}
+
+Write a short market commentary for farmers based ONLY on these figures plus general seasonal knowledge.
+Rules: do not invent prices, percentage changes or trends over time (only one day of data is given); refer to prices exactly as given; keep advice practical (e.g. compare markets, grading, timing of sale).`
+      : `You are an agricultural market analyst. Live mandi prices for ${region}, India are not available.
+Give general, seasonal marketing guidance for farmers in ${region}. Do not state any prices, percentages or claims about current market movements.`;
+
+    const schema = {
+      type: Type.OBJECT,
+      properties: {
+        summary: { type: Type.STRING },
+        highlights: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: { commodity: { type: Type.STRING }, note: { type: Type.STRING } },
+            required: ["commodity", "note"],
           },
-          marketSentiment: { type: Type.STRING },
-          advisorTip: { type: Type.STRING },
         },
-        required: ["topChangingCrops", "marketSentiment", "advisorTip"]
-      };
+        advice: { type: Type.ARRAY, items: { type: Type.STRING } },
+      },
+      required: ["summary", "highlights", "advice"],
+    };
 
-      const data = await generateAIContent(prompt, schema);
+    try {
+      const raw = await generateAIContent(prompt, schema);
+      const summary = cleanText(raw?.summary, 1200);
+      if (!summary) throw new AiError("AI_INVALID_RESPONSE", "Empty market commentary");
+      const data = {
+        basis,
+        summary,
+        highlights: (Array.isArray(raw?.highlights) ? raw.highlights : [])
+          .map((h: any) => ({ commodity: cleanText(h?.commodity, 80), note: cleanText(h?.note, 400) }))
+          .filter((h: any) => h.commodity && h.note)
+          .slice(0, 6),
+        advice: (Array.isArray(raw?.advice) ? raw.advice : []).map((a: any) => cleanText(a, 300)).filter(Boolean).slice(0, 5),
+        generatedAt: new Date().toISOString(),
+      };
       setCachedData(cacheKey, data);
       res.json(data);
-    } catch (error: any) {
-      console.error("AI Market Pulse Error:", error);
-      const data = FALLBACK_MARKET[cleanRegion] || FALLBACK_MARKET.default;
-      res.json(data);
+    } catch (error) {
+      const code = classifyAiError(error);
+      console.warn(`AI market commentary failed (${code})`);
+      const { status, body } = errorBody(code, error instanceof AiError ? error.message : undefined);
+      res.status(status).json(body);
     }
   });
 
@@ -1307,6 +995,10 @@ async function startServer() {
       });
     }
   });
+
+  // Keep the keyless AGMARKNET archive current (downloads only when GitHub has a new version).
+  syncSnapshot().catch(() => {});
+  setInterval(() => syncSnapshot().catch(() => {}), 6 * 60 * 60 * 1000).unref();
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);

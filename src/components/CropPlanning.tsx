@@ -1,188 +1,380 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { 
-  Sprout, 
-  Droplets, 
-  FlaskConical, 
-  Calendar, 
-  Coins, 
+import {
+  Sprout,
+  Droplets,
+  FlaskConical,
+  Calendar,
+  Coins,
   Loader2,
   CheckCircle2,
-  Info,
   Sun,
   Thermometer,
   ShieldAlert,
   TrendingUp,
-  Activity
+  Activity,
+  MapPin,
+  Info,
+  AlertTriangle,
+  RefreshCw,
+  ExternalLink,
+  ChevronDown,
+  X
 } from "lucide-react";
-import { getCropRecommendation } from "@/src/services/geminiService";
+import { getCropRecommendation, CropPlanRequestError, type SoilParamInput } from "@/src/services/geminiService";
+import type { CropPlanResponse } from "../../shared/cropPlan";
+import CropPlanResult from "./CropPlanResult";
+import CropPlanLoading from "./CropPlanLoading";
+import {
+  fetchStates,
+  fetchDistricts,
+  fetchSubdistricts,
+  fetchVillages,
+  fetchSoil,
+  type Place,
+  type SoilLookup,
+  type NutrientSummary,
+} from "@/src/services/locationService";
+import { indianStates, normalizeStateName } from "@/src/lib/indianStates";
 import { cn, formatCurrency } from "@/src/lib/utils";
 import { toast } from "sonner";
+import SearchableSelect, { type SelectOption } from "./SearchableSelect";
 
 import { useLanguage } from '../contexts/LanguageContext';
 
-const soilProfiles: Record<string, { n: number; p: number; k: number; ph: number }> = {
-  "Andaman and Nicobar Islands": { n: 42, p: 24, k: 38, ph: 6.1 },
-  "Andhra Pradesh": { n: 36, p: 28, k: 42, ph: 7.4 },
-  "Arunachal Pradesh": { n: 58, p: 22, k: 35, ph: 5.8 },
-  Assam: { n: 62, p: 26, k: 44, ph: 5.6 },
-  Bihar: { n: 68, p: 38, k: 48, ph: 7.2 },
-  Chandigarh: { n: 72, p: 42, k: 54, ph: 7.8 },
-  Chhattisgarh: { n: 48, p: 24, k: 36, ph: 6.5 },
-  "Dadra and Nagar Haveli and Daman and Diu": { n: 44, p: 30, k: 40, ph: 6.8 },
-  Delhi: { n: 64, p: 36, k: 52, ph: 7.9 },
-  Goa: { n: 46, p: 20, k: 48, ph: 5.9 },
-  Gujarat: { n: 32, p: 34, k: 46, ph: 7.8 },
-  Haryana: { n: 78, p: 44, k: 58, ph: 8.0 },
-  "Himachal Pradesh": { n: 54, p: 30, k: 40, ph: 6.2 },
-  "Jammu and Kashmir": { n: 50, p: 28, k: 44, ph: 6.6 },
-  Jharkhand: { n: 40, p: 22, k: 32, ph: 5.7 },
-  Karnataka: { n: 38, p: 26, k: 34, ph: 6.8 },
-  Kerala: { n: 52, p: 24, k: 56, ph: 5.5 },
-  Ladakh: { n: 18, p: 16, k: 24, ph: 7.6 },
-  Lakshadweep: { n: 34, p: 18, k: 45, ph: 6.0 },
-  "Madhya Pradesh": { n: 46, p: 32, k: 44, ph: 7.1 },
-  Maharashtra: { n: 40, p: 35, k: 30, ph: 6.5 },
-  Manipur: { n: 56, p: 25, k: 38, ph: 5.9 },
-  Meghalaya: { n: 60, p: 20, k: 42, ph: 5.3 },
-  Mizoram: { n: 44, p: 18, k: 30, ph: 5.2 },
-  Nagaland: { n: 52, p: 21, k: 34, ph: 5.6 },
-  Odisha: { n: 50, p: 27, k: 40, ph: 6.2 },
-  Puducherry: { n: 38, p: 31, k: 44, ph: 7.0 },
-  Punjab: { n: 84, p: 48, k: 62, ph: 8.1 },
-  Rajasthan: { n: 24, p: 30, k: 28, ph: 8.2 },
-  Sikkim: { n: 48, p: 19, k: 36, ph: 5.5 },
-  "Tamil Nadu": { n: 34, p: 29, k: 38, ph: 7.3 },
-  Telangana: { n: 35, p: 30, k: 36, ph: 7.5 },
-  Tripura: { n: 58, p: 23, k: 46, ph: 5.8 },
-  "Uttar Pradesh": { n: 76, p: 46, k: 56, ph: 7.7 },
-  Uttarakhand: { n: 56, p: 27, k: 42, ph: 6.1 },
-  "West Bengal": { n: 70, p: 34, k: 52, ph: 6.4 },
+type SoilKey = "n" | "p" | "k" | "ph";
+const SOIL_KEYS: SoilKey[] = ["n", "p", "k", "ph"];
+
+// Same plausibility bounds as the server (server/cropInput.ts): N, P, K in kg/ha as printed on a
+// Soil Health Card. They catch typos and unit mix-ups, not agronomic ratings.
+const SOIL_BOUNDS: Record<SoilKey, { min: number; max: number; step: number }> = {
+  n: { min: 0, max: 2000, step: 1 },
+  p: { min: 0, max: 1000, step: 0.1 },
+  k: { min: 0, max: 3000, step: 1 },
+  ph: { min: 3, max: 10, step: 0.1 },
 };
 
-export default function CropPlanning({ selectedState }: { selectedState: string }) {
-  const { t } = useLanguage();
-  const [loading, setLoading] = useState(false);
-  const [recommendations, setRecommendations] = useState<any[]>([]);
-  const [selectedIndex, setSelectedIndex] = useState(0);
-  
-  const [formData, setFormData] = useState({
-    n: 40,
-    p: 35,
-    k: 30,
-    ph: 6.5,
-    season: "Winter",
-    region: selectedState,
-    acres: 1
-  });
+const fmt = (s: string, vars: Record<string, string | number>) =>
+  s.replace(/\{(\w+)\}/g, (_, k) => String(vars[k] ?? ""));
 
-  React.useEffect(() => {
-    const profile = soilProfiles[selectedState] || soilProfiles.Maharashtra;
-    setFormData(prev => ({
-      ...prev,
-      ...profile,
-      region: selectedState,
-    }));
-    setRecommendations([]);
-    setSelectedIndex(0);
-  }, [selectedState]);
+// Same-named places (common for villages) get their LGD code shown so the farmer can tell them apart.
+const toOptions = (places: Place[]): SelectOption[] => {
+  const counts = new Map<string, number>();
+  for (const p of places) counts.set(p.name.toLowerCase(), (counts.get(p.name.toLowerCase()) ?? 0) + 1);
+  return places.map((p) => {
+    const dup = (counts.get(p.name.toLowerCase()) ?? 0) > 1;
+    const sublabel = [p.nameLocal, dup ? `LGD ${p.code}` : null].filter(Boolean).join(" · ");
+    return { value: p.code, label: p.name, sublabel: sublabel || undefined };
+  });
+};
+
+
+function usePlaces(key: string | null, load: (signal: AbortSignal) => Promise<Place[]>) {
+  const [state, setState] = useState<{ items: Place[]; loading: boolean; error: string | null }>({
+    items: [],
+    loading: false,
+    error: null,
+  });
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    if (!key) {
+      setState({ items: [], loading: false, error: null });
+      return;
+    }
+    const controller = new AbortController();
+    setState({ items: [], loading: true, error: null });
+    load(controller.signal)
+      .then((items) => setState({ items, loading: false, error: null }))
+      .catch((e) => {
+        if (!controller.signal.aborted) setState({ items: [], loading: false, error: e.message });
+      });
+    return () => controller.abort();
+  }, [key, attempt]);
+
+  return { ...state, retry: () => setAttempt((a) => a + 1) };
+}
+
+type SoilState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "done"; data: SoilLookup }
+  | { status: "error"; error: string };
+
+type FieldStatus =
+  | { kind: "manual"; value: number; valid: boolean }
+  | { kind: "area"; area: NutrientSummary }
+  | { kind: "missing" };
+
+export default function CropPlanning({
+  selectedState,
+  setSelectedState,
+}: {
+  selectedState: string;
+  setSelectedState: (state: string) => void;
+}) {
+  const { t, language } = useLanguage();
+  const tl = t.planning.location;
+  const ts = t.planning.soil;
+  const [loading, setLoading] = useState(false);
+  const resultsRef = useRef<HTMLDivElement>(null);
+  const [plan, setPlan] = useState<CropPlanResponse | null>(null);
+  const [planError, setPlanError] = useState<CropPlanRequestError | null>(null);
+  // Results always use the acreage currently entered (per-acre figures come from the server).
+  const [planAcres, setPlanAcres] = useState(1);
+  const [season, setSeason] = useState("Winter");
+  const [acres, setAcres] = useState("1");
+
+  // Location (LGD codes)
+  const states = usePlaces("states", fetchStates);
+  const lgdState = states.items.find((s) => normalizeStateName(s.name) === normalizeStateName(selectedState));
+  const stateCode = lgdState?.code ?? null;
+  const [district, setDistrict] = useState<Place | null>(null);
+  const [subdistrict, setSubdistrict] = useState<Place | null>(null);
+  const [village, setVillage] = useState<Place | null>(null);
+
+  const districts = usePlaces(stateCode ? `d:${stateCode}` : null, (s) => fetchDistricts(stateCode!, s));
+  const subdistricts = usePlaces(district ? `sd:${district.code}` : null, (s) => fetchSubdistricts(district!.code, s));
+  const villages = usePlaces(subdistrict ? `v:${subdistrict.code}` : null, (s) => fetchVillages(subdistrict!.code, s));
+
+  // The state can also change from the sidebar; dependent levels must reset either way.
+  useEffect(() => {
+    setDistrict(null);
+    setSubdistrict(null);
+    setVillage(null);
+    setPlan(null);
+    setPlanError(null);
+  }, [stateCode]);
+
+  // Soil: retrieved automatically for the selected location. Values from the farmer's own soil
+  // test report (optional) override the area estimate for that nutrient.
+  const [manual, setManual] = useState<Record<SoilKey, string>>({ n: "", p: "", k: "", ph: "" });
+  const [showOwnReport, setShowOwnReport] = useState(false);
+  const [soil, setSoil] = useState<SoilState>({ status: "idle" });
+  const [soilAttempt, setSoilAttempt] = useState(0);
+  const soilRequest = useRef(0);
+
+  useEffect(() => {
+    if (!stateCode || !district) {
+      setSoil({ status: "idle" });
+      return;
+    }
+    // Abort the previous request and ignore any response that is not for the latest location.
+    const requestId = ++soilRequest.current;
+    const controller = new AbortController();
+    setSoil({ status: "loading" });
+    fetchSoil({ stateCode, districtCode: district.code, villageCode: village?.code }, controller.signal)
+      .then((data) => {
+        if (requestId === soilRequest.current) setSoil({ status: "done", data });
+      })
+      .catch((e) => {
+        if (!controller.signal.aborted && requestId === soilRequest.current) setSoil({ status: "error", error: e.message });
+      });
+    return () => controller.abort();
+  }, [stateCode, district?.code, village?.code, soilAttempt]);
+
+  const [locationMeta, setLocationMeta] = useState<{ fetchedAt?: string } | null>(null);
+  useEffect(() => {
+    fetch("/api/locations/meta")
+      .then((r) => (r.ok ? r.json() : null))
+      .then(setLocationMeta)
+      .catch(() => setLocationMeta(null));
+  }, []);
+
+  const areaData = soil.status === "done" && soil.data.status === "available" ? soil.data : null;
+
+  const fieldStatus = (key: SoilKey): FieldStatus => {
+    const raw = manual[key].trim();
+    if (raw !== "") {
+      const value = Number(raw);
+      const { min, max } = SOIL_BOUNDS[key];
+      return { kind: "manual", value, valid: Number.isFinite(value) && value >= min && value <= max };
+    }
+    const area = areaData?.nutrients[key];
+    return area ? { kind: "area", area } : { kind: "missing" };
+  };
+  const fields = Object.fromEntries(SOIL_KEYS.map((k) => [k, fieldStatus(k)])) as Record<SoilKey, FieldStatus>;
+  const acresNum = Number(acres);
+  const acresValid = Number.isFinite(acresNum) && acresNum > 0 && acresNum <= 100000;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (loading) return; // one request at a time
+    const soilInvalid = SOIL_KEYS.some((k) => fields[k].kind === "manual" && !(fields[k] as any).valid);
+    if (soilInvalid) {
+      setShowOwnReport(true);
+      toast.error(ts.fixErrors);
+      return;
+    }
+    if (!acresValid) {
+      toast.error(t.planning.acresInvalid);
+      return;
+    }
+
+    const soilPayload = Object.fromEntries(
+      SOIL_KEYS.map((k) => {
+        const f = fields[k];
+        return [k, f.kind === "manual" ? { value: f.value } : f.kind === "area" ? { area: f.area } : {}];
+      }),
+    ) as Record<SoilKey, SoilParamInput>;
+
     setLoading(true);
+    setPlanError(null);
+    // The button is at the end of a long form; bring the progress view into sight.
+    requestAnimationFrame(() => {
+      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      resultsRef.current?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
+    });
     try {
-      const result = await getCropRecommendation(formData);
-      setRecommendations(result);
-      setSelectedIndex(0);
-      toast.success("AI Recommendations Generated!");
-    } catch (error) {
+      const result = await getCropRecommendation({
+        region: selectedState,
+        season,
+        location: { district: district?.name, subdistrict: subdistrict?.name, village: village?.name },
+        soilContext: areaData ? { level: areaData.level, areaName: areaData.area.name, cycle: areaData.cycle } : undefined,
+        soil: soilPayload,
+      });
+      setPlan(result);
+      setPlanAcres(acresNum);
+    } catch (error: any) {
       console.error(error);
-      toast.error("Failed to generate recommendations. The AI service may be temporarily down.");
+      setPlan(null);
+      setPlanError(
+        error instanceof CropPlanRequestError ? error : new CropPlanRequestError("AI_ERROR", String(error?.message ?? error), true),
+      );
     } finally {
       setLoading(false);
     }
   };
 
-  const currentRec = recommendations[selectedIndex];
+  const displayAcres = acresValid ? acresNum : planAcres;
+  const dateLocale = language === "hi" ? "hi-IN" : language === "te" ? "te-IN" : "en-IN";
+
+  const selectStrings = {
+    placeholder: tl.placeholder,
+    search: tl.search,
+    noMatches: tl.noMatches,
+    loading: tl.loading,
+    retry: tl.retry,
+    showingFirst: tl.showingFirst,
+  };
 
   return (
-    <div className="space-y-8 pb-20">
+    <div className="space-y-6 pb-12">
       <div>
         <p className="text-emerald-600 font-semibold text-sm uppercase tracking-wider mb-1">{t.planning.planningTool}</p>
-        <h2 className="text-3xl font-bold text-gray-900 tracking-tight">{t.planning.title}</h2>
+        <h2 className="text-2xl sm:text-3xl font-bold text-gray-900 tracking-tight">{t.planning.title}</h2>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        {/* Input Form */}
-        <div className="lg:col-span-5 bg-white rounded-3xl p-8 border border-gray-200 shadow-sm space-y-8">
-          <div className="flex items-center gap-3 pb-6 border-b border-gray-100 mb-8">
-            <div className="p-2 bg-emerald-50 rounded-xl text-emerald-600">
-              <FlaskConical className="w-5 h-5" />
-            </div>
-            <h3 className="font-bold text-gray-900">{t.dashboard.soilHealth}</h3>
+      {/* Inputs: two balanced cards side by side on wide screens, stacked below that */}
+      <form onSubmit={handleSubmit} noValidate className="grid grid-cols-1 2xl:grid-cols-12 gap-6 items-stretch">
+        {/* Location + plan settings */}
+        <div className="2xl:col-span-5 bg-white rounded-3xl p-5 sm:p-6 border border-gray-200 shadow-sm flex flex-col gap-5 min-w-0">
+          <CardHeader icon={MapPin} title={tl.title} />
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 2xl:grid-cols-2 gap-4">
+              <SearchableSelect
+                label={tl.state}
+                options={toOptions(states.items)}
+                value={stateCode}
+                onChange={(o) => {
+                  if (!o) return;
+                  const sidebarName = indianStates.find((n) => normalizeStateName(n) === normalizeStateName(o.label));
+                  setSelectedState(sidebarName ?? o.label);
+                }}
+                loading={states.loading}
+                error={states.error ? tl.loadError : null}
+                onRetry={states.retry}
+                strings={selectStrings}
+              />
+              <SearchableSelect
+                label={tl.district}
+                options={toOptions(districts.items)}
+                value={district?.code ?? null}
+                onChange={(o) => {
+                  setDistrict(o ? districts.items.find((d) => d.code === o.value) ?? null : null);
+                  setSubdistrict(null);
+                  setVillage(null);
+                }}
+                disabled={!stateCode}
+                loading={districts.loading}
+                error={districts.error ? tl.loadError : null}
+                onRetry={districts.retry}
+                strings={selectStrings}
+                hint={!stateCode ? tl.selectParentFirst : undefined}
+              />
+              <SearchableSelect
+                label={tl.subdistrict}
+                options={toOptions(subdistricts.items)}
+                value={subdistrict?.code ?? null}
+                onChange={(o) => {
+                  setSubdistrict(o ? subdistricts.items.find((d) => d.code === o.value) ?? null : null);
+                  setVillage(null);
+                }}
+                disabled={!district}
+                loading={subdistricts.loading}
+                error={subdistricts.error ? tl.loadError : null}
+                onRetry={subdistricts.retry}
+                strings={selectStrings}
+                hint={!district ? tl.selectParentFirst : undefined}
+              />
+              <SearchableSelect
+                label={tl.village}
+                options={toOptions(villages.items)}
+                value={village?.code ?? null}
+                onChange={(o) => setVillage(o ? villages.items.find((v) => v.code === o.value) ?? null : null)}
+                disabled={!subdistrict}
+                loading={villages.loading}
+                error={villages.error ? tl.loadError : null}
+                onRetry={villages.retry}
+                strings={selectStrings}
+                hint={!subdistrict ? tl.selectParentFirst : !village ? tl.optionalVillage : undefined}
+              />
           </div>
+            <p className="text-[11px] text-gray-400">
+              {tl.source}
+              {locationMeta?.fetchedAt &&
+                ` · ${new Date(locationMeta.fetchedAt).toLocaleDateString(dateLocale, { day: "numeric", month: "short", year: "numeric" })}`}
+            </p>
 
-          <form onSubmit={handleSubmit} className="space-y-6">
-            <div className="grid grid-cols-2 gap-4">
-              <NutrientInput 
-                label={t.planning.soilN} 
-                value={formData.n} 
-                onChange={(val) => setFormData({...formData, n: val})}
-                color="emerald"
-                max={140}
-              />
-              <NutrientInput 
-                label={t.planning.soilP} 
-                value={formData.p} 
-                onChange={(val) => setFormData({...formData, p: val})}
-                color="blue"
-                max={140}
-              />
-              <NutrientInput 
-                label={t.planning.soilK} 
-                value={formData.k} 
-                onChange={(val) => setFormData({...formData, k: val})}
-                color="amber"
-                max={140}
-              />
-              <NutrientInput 
-                label={t.planning.soilPh} 
-                value={formData.ph} 
-                onChange={(val) => setFormData({...formData, ph: val})}
-                color="purple"
-                max={14}
-                step={0.1}
-              />
-            </div>
+          <div className="mt-auto pt-5 border-t border-gray-100 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-2 gap-4 items-start">
+              <div className="space-y-2">
+                <label htmlFor="season" className="text-xs font-bold text-gray-500 uppercase tracking-widest">{t.common.season}</label>
+                <select
+                  id="season"
+                  value={season}
+                  onChange={(e) => setSeason(e.target.value)}
+                  className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all"
+                >
+                  <option value="Spring">{t.planning.seasons.spring}</option>
+                  <option value="Summer">{t.planning.seasons.summer}</option>
+                  <option value="Autumn">{t.planning.seasons.autumn}</option>
+                  <option value="Winter">{t.planning.seasons.winter}</option>
+                </select>
+              </div>
 
-            <div className="space-y-2 pt-2">
-              <label className="text-xs font-bold text-gray-500 uppercase tracking-widest">{t.common.season}</label>
-              <select 
-                value={formData.season}
-                onChange={(e) => setFormData({...formData, season: e.target.value})}
-                className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all"
-              >
-                <option value="Spring">{t.planning.seasons.spring}</option>
-                <option value="Summer">{t.planning.seasons.summer}</option>
-                <option value="Autumn">{t.planning.seasons.autumn}</option>
-                <option value="Winter">{t.planning.seasons.winter}</option>
-              </select>
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-xs font-bold text-gray-500 uppercase tracking-widest">{t.common.acres}</label>
-              <input 
-                type="number" 
-                value={formData.acres}
-                onChange={(e) => setFormData({...formData, acres: Number(e.target.value)})}
-                className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all"
-              />
-            </div>
-
-            <button 
+              <div className="space-y-2">
+                <label htmlFor="acres" className="text-xs font-bold text-gray-500 uppercase tracking-widest">{t.common.acres}</label>
+                <input
+                  id="acres"
+                  type="number"
+                  min={0}
+                  step="any"
+                  inputMode="decimal"
+                  value={acres}
+                  onChange={(e) => setAcres(e.target.value)}
+                  aria-invalid={!acresValid}
+                  className={cn(
+                    "w-full bg-gray-50 border rounded-xl px-4 py-3 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all",
+                    acresValid ? "border-gray-200" : "border-rose-300",
+                  )}
+                />
+                {!acresValid && <p className="text-[11px] text-rose-600">{t.planning.acresInvalid}</p>}
+              </div>
+            <div className="sm:col-span-2 lg:col-span-1 2xl:col-span-2 lg:pt-6 2xl:pt-0">
+            <button
+              id="generate-btn"
               type="submit"
               disabled={loading}
-              className="w-full bg-emerald-600 text-white rounded-2xl py-4 font-bold text-sm hover:bg-emerald-700 transition-all shadow-lg shadow-emerald-600/20 flex items-center justify-center gap-2 disabled:opacity-70"
+              className="w-full bg-emerald-600 text-white rounded-2xl py-3.5 font-bold text-sm hover:bg-emerald-700 transition-all shadow-lg shadow-emerald-600/20 flex items-center justify-center gap-2 disabled:opacity-70"
             >
               {loading ? (
                 <>
@@ -192,252 +384,149 @@ export default function CropPlanning({ selectedState }: { selectedState: string 
                 t.planning.optimizeBtn
               )}
             </button>
-          </form>
+            </div>
+          </div>
         </div>
 
-        {/* Results / Recommendation Area */}
-        <div className="lg:col-span-7 space-y-6">
-          <AnimatePresence mode="wait">
-            {recommendations.length === 0 && !loading ? (
-              <motion.div 
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                key="empty"
-                className="h-full min-h-[500px] border-2 border-dashed border-gray-200 rounded-3xl flex flex-col items-center justify-center p-12 text-center"
-              >
-                <div className="w-20 h-20 bg-emerald-50 rounded-full flex items-center justify-center mb-6">
-                  <Sprout className="w-10 h-10 text-emerald-300" />
-                </div>
-                <h3 className="text-xl font-bold text-gray-900 mb-2">{t.planning.awaitingInput}</h3>
-                <p className="text-gray-500 text-sm max-w-sm leading-relaxed">
-                  {t.planning.awaitingInputDesc}
-                </p>
-              </motion.div>
-            ) : loading ? (
-              <motion.div 
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                key="loading"
-                className="h-full min-h-[500px] bg-white rounded-3xl border border-gray-200 p-12 flex flex-col items-center justify-center space-y-8"
-              >
-                <div className="relative">
-                  <motion.div 
-                    animate={{ rotate: 360 }}
-                    transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
-                    className="w-32 h-32 border-4 border-emerald-100 rounded-full"
+        {/* Soil */}
+        <div className="2xl:col-span-7 bg-white rounded-3xl p-5 sm:p-6 border border-gray-200 shadow-sm flex flex-col gap-5 min-w-0">
+          <CardHeader icon={FlaskConical} title={ts.title} />
+            <SoilSourcePanel
+              soil={soil}
+              onRetry={() => setSoilAttempt((a) => a + 1)}
+              dateLocale={dateLocale}
+            />
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+              {SOIL_KEYS.map((k) => (
+                <div key={k}>
+                  <SoilValue
+                    label={{ n: t.planning.soilN, p: t.planning.soilP, k: t.planning.soilK, ph: t.planning.soilPh }[k]}
+                    status={fields[k]}
+                    unit={k === "ph" ? "" : ts.unit}
+                    loading={soil.status === "loading"}
                   />
-                  <motion.div 
-                    animate={{ rotate: -360 }}
-                    transition={{ duration: 2, repeat: Infinity, ease: "linear" }}
-                    className="w-32 h-32 border-t-4 border-emerald-500 border-r-4 border-r-transparent rounded-full absolute top-0"
-                  />
-                  <div className="absolute inset-0 flex items-center justify-center">
-                    <Sprout className="w-10 h-10 text-emerald-500 animate-pulse" />
-                  </div>
                 </div>
-                <div className="text-center">
-                  <h3 className="font-bold text-gray-900 text-lg">{t.planning.aiProcessing}</h3>
-                  <p className="text-gray-400 text-sm font-medium">{t.planning.aiProcessingDesc}</p>
-                </div>
-              </motion.div>
-            ) : (
-              <motion.div 
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                key="result"
-                className="space-y-6"
+              ))}
+            </div>
+
+            {/* Optional: the farmer's own soil test report */}
+            <div className="rounded-2xl border border-gray-100">
+              <button
+                type="button"
+                onClick={() => setShowOwnReport((v) => !v)}
+                aria-expanded={showOwnReport}
+                className="w-full flex items-center justify-between gap-2 px-4 py-3 text-xs font-bold text-gray-600 hover:text-emerald-700"
               >
-                {/* Crop Selector Tabs */}
-                <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-hide">
-                  {recommendations.map((rec: any, idx: number) => (
-                    <button
-                      key={idx}
-                      onClick={() => setSelectedIndex(idx)}
-                      className={cn(
-                        "px-6 py-3 rounded-2xl text-xs font-black uppercase tracking-widest whitespace-nowrap transition-all border",
-                        selectedIndex === idx 
-                          ? "bg-emerald-600 text-white border-emerald-600 shadow-lg shadow-emerald-600/20" 
-                          : "bg-white text-gray-500 border-gray-200 hover:border-emerald-200"
-                      )}
-                    >
-                      {rec.cropName}
-                    </button>
-                  ))}
-                </div>
-
-                {/* Result Hero */}
-                <div className="bg-white rounded-3xl border border-gray-200 shadow-sm overflow-hidden">
-                  <div className="bg-emerald-600 p-8 text-white relative overflow-hidden">
-                    <div className="relative z-10 flex justify-between items-start">
-                      <div>
-                        <p className="text-emerald-100 text-xs font-bold uppercase tracking-widest mb-2">{t.planning.recommendation}</p>
-                        <h3 className="text-5xl font-black tracking-tight">{currentRec.cropName}</h3>
+                <span>{ts.ownReportToggle}</span>
+                <ChevronDown className={cn("w-4 h-4 transition-transform", showOwnReport && "rotate-180")} />
+              </button>
+              {showOwnReport && (
+                <div className="px-4 pb-4 space-y-3">
+                  <p className="text-[11px] text-gray-500">{ts.ownReportHint}</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {SOIL_KEYS.map((k) => (
+                      <div key={k}>
+                        <ReportInput
+                          soilKey={k}
+                          label={{ n: t.planning.soilN, p: t.planning.soilP, k: t.planning.soilK, ph: t.planning.soilPh }[k]}
+                          raw={manual[k]}
+                          invalid={fields[k].kind === "manual" && !(fields[k] as any).valid}
+                          onChange={(v) => setManual((m) => ({ ...m, [k]: v }))}
+                        />
                       </div>
-                      <div className="bg-white/20 backdrop-blur-md rounded-2xl p-4 text-center min-w-[120px]">
-                        <p className="text-[10px] font-bold uppercase mb-1">{t.common.confidence}</p>
-                        <div className="text-3xl font-black">{currentRec.confidence.toFixed(3)}%</div>
-                      </div>
-                    </div>
-                    {/* Decorative pattern */}
-                    <div className="absolute top-0 right-0 w-64 h-64 bg-white/5 rounded-full -mr-20 -mt-20 blur-3xl" />
-                  </div>
-
-                  <div className="p-8 grid grid-cols-3 gap-6 border-b border-gray-100">
-                    <ResultStat 
-                      label={t.planning.expectedYield} 
-                      value={`${currentRec.expectedYield * formData.acres} kg`} 
-                      icon={Droplets}
-                      unit={t.planning.totalYield}
-                    />
-                    <ResultStat 
-                      label={t.planning.estDuration} 
-                      value={`${currentRec.estimatedDuration} Months`} 
-                      icon={Calendar}
-                      unit={t.planning.cropCycle}
-                    />
-                    <ResultStat 
-                      label={t.planning.marketValue} 
-                      value={currentRec.marketPotential || "High"}
-                      icon={TrendingUp}
-                      unit={t.planning.marketTrend}
-                    />
-                  </div>
-
-                  <div className="p-8 space-y-8">
-                    <div>
-                      <h4 className="flex items-center gap-2 font-bold text-gray-900 mb-3">
-                        <CheckCircle2 className="w-5 h-5 text-emerald-500" /> {t.planning.rationale}
-                      </h4>
-                      <div className="bg-emerald-50/50 rounded-2xl p-6 border border-emerald-100">
-                        <p className="text-emerald-900 text-sm leading-relaxed font-medium">
-                          {currentRec.rationale}
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="pt-4 border-t border-gray-100">
-                      <h4 className="flex items-center gap-2 font-black text-gray-900 mb-4 text-sm uppercase tracking-widest">
-                        <Coins className="w-5 h-5 text-amber-500" /> {t.market.insights}
-                      </h4>
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                        <div className="bg-amber-50/50 p-6 rounded-3xl border border-amber-100">
-                          <p className="text-[10px] font-bold text-amber-800 uppercase tracking-widest mb-1">{t.common.investment}</p>
-                          <div className="text-2xl font-black text-amber-950">
-                            {formatCurrency(currentRec.estimatedInvestment * formData.acres)}
-                          </div>
-                          <p className="text-[10px] text-amber-700/60 font-medium italic mt-1">For {formData.acres} {t.common.acres}{formData.acres > 1 ? 's' : ''}</p>
-                        </div>
-                        <div className="bg-emerald-50/50 p-6 rounded-3xl border border-emerald-100">
-                          <p className="text-[10px] font-bold text-emerald-800 uppercase tracking-widest mb-1">{t.common.revenue}</p>
-                          <div className="text-2xl font-black text-emerald-950">
-                            {formatCurrency(currentRec.expectedRevenue * formData.acres)}
-                          </div>
-                          <p className="text-[10px] text-emerald-700/60 font-medium italic mt-1">{t.planning.grossRevenue}</p>
-                        </div>
-                        <div className="bg-blue-50/50 p-6 rounded-3xl border border-blue-100">
-                          <p className="text-[10px] font-bold text-blue-800 uppercase tracking-widest mb-1">{t.common.profit}</p>
-                          <div className="text-2xl font-black text-blue-950">
-                            +{currentRec.profitPercentage}%
-                          </div>
-                          <p className="text-[10px] text-blue-700/60 font-medium italic mt-1">{t.planning.roiEstimate}</p>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-4">
-                      <RequirementCard 
-                        icon={Droplets} 
-                        label={t.planning.water} 
-                        value={currentRec.requirements?.water} 
-                        color="blue"
-                      />
-                      <RequirementCard 
-                        icon={Sun} 
-                        label={t.planning.sunlight} 
-                        value={currentRec.requirements?.sunlight} 
-                        color="amber"
-                      />
-                      <RequirementCard 
-                        icon={Thermometer} 
-                        label={t.planning.temp} 
-                        value={currentRec.requirements?.temperature} 
-                        color="orange"
-                      />
-                      <RequirementCard 
-                        icon={FlaskConical} 
-                        label={t.planning.fertilizer} 
-                        value={currentRec.requirements?.fertilizer} 
-                        color="emerald"
-                      />
-                    </div>
-
-                    <div className="bg-rose-50 rounded-2xl p-6 border border-rose-100">
-                      <h4 className="flex items-center gap-2 font-bold text-rose-900 mb-2 text-sm uppercase tracking-wider">
-                        <ShieldAlert className="w-4 h-4" /> {t.planning.pestRisks}
-                      </h4>
-                      <p className="text-rose-800 text-sm leading-relaxed font-medium">
-                        {currentRec.pestRisk || "Low risk if standard protocols followed."}
-                      </p>
-                    </div>
-
-                    {/* Growth Timeline */}
-                    <div className="pt-4">
-                      <h4 className="text-sm font-bold text-gray-400 uppercase tracking-widest mb-4">{t.planning.cultivationTimeline}</h4>
-                      <div className="relative h-20 bg-gray-50 rounded-2xl border border-gray-100 p-4 overflow-hidden">
-                        <div className="flex justify-between relative z-10">
-                          <TimelineStep label={t.planning.sowing} icon={Sprout} active />
-                          <TimelineStep label={t.planning.growth} icon={Activity} active />
-                          <TimelineStep label={t.planning.maturity} icon={Sun} active />
-                          <TimelineStep label={t.planning.harvest} icon={CheckCircle2} />
-                        </div>
-                        <div className="absolute top-1/2 left-0 right-0 h-0.5 bg-gray-200 -translate-y-1/2 mx-12">
-                          <motion.div 
-                            initial={{ width: 0 }}
-                            animate={{ width: "75%" }}
-                            className="h-full bg-emerald-500"
-                          />
-                        </div>
-                      </div>
-                    </div>
+                    ))}
                   </div>
                 </div>
-              </motion.div>
+              )}
+            </div>
+
+            {soil.status !== "loading" && SOIL_KEYS.every((k) => fields[k].kind === "missing") && (
+              <p className="flex gap-2 items-start text-[11px] text-gray-500">
+                <Info className="w-3.5 h-3.5 shrink-0 mt-0.5" /> {ts.noSoilWarning}
+              </p>
             )}
-          </AnimatePresence>
         </div>
-      </div>
+      </form>
+
+      {/* Results / Recommendation Area: full width, sized by its content */}
+      <section ref={resultsRef} className="min-w-0 scroll-mt-20 lg:scroll-mt-8" aria-label={t.planning.recommendation}>
+          <AnimatePresence mode="wait" initial={false}>
+            <motion.div
+              key={loading ? "loading" : planError ? "error" : plan ? `plan-${plan.generatedAt}` : "empty"}
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+            >
+              {loading ? (
+                <CropPlanLoading />
+              ) : planError ? (
+                <div className="bg-white rounded-3xl border border-rose-200 p-6 sm:p-8 space-y-4" role="alert" data-testid="plan-error">
+                  <div className="flex gap-3 items-start">
+                    <AlertTriangle className="w-6 h-6 text-rose-500 shrink-0" />
+                    <div className="space-y-1">
+                      <h3 className="font-bold text-gray-900">{t.planning.result.errorTitle}</h3>
+                      <p className="text-sm text-gray-700">{t.planning.result.errors[planError.code] ?? t.planning.result.errors.AI_ERROR}</p>
+                      <p className="text-xs text-gray-400">{planError.message}</p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => (document.getElementById("generate-btn") as HTMLButtonElement | null)?.click()}
+                    className="px-5 py-3 bg-emerald-600 text-white rounded-2xl text-sm font-bold hover:bg-emerald-700 flex items-center gap-2"
+                  >
+                    <RefreshCw className="w-4 h-4" /> {t.planning.result.retry}
+                  </button>
+                </div>
+              ) : plan ? (
+                <CropPlanResult plan={plan} acres={displayAcres} />
+              ) : (
+                <div className="flex items-center gap-4 border-2 border-dashed border-gray-200 rounded-3xl p-5 sm:p-6">
+                  <div className="w-12 h-12 bg-emerald-50 rounded-2xl flex items-center justify-center shrink-0">
+                    <Sprout className="w-6 h-6 text-emerald-400" />
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="font-bold text-gray-900">{t.planning.awaitingInput}</h3>
+                    <p className="text-gray-500 text-sm leading-relaxed">{t.planning.awaitingInputDesc}</p>
+                  </div>
+                </div>
+              )}
+            </motion.div>
+          </AnimatePresence>
+      </section>
 
       {/* Regional Knowledge Base */}
-      <div className="pt-12 border-t border-gray-100">
-        <div className="flex items-center justify-between mb-8">
+      <div className="pt-6 border-t border-gray-100">
+        <div className="flex items-center justify-between gap-4 mb-5">
           <div>
-            <h3 className="text-2xl font-black text-gray-900 tracking-tight">{t.planning.knowledgeBase}</h3>
+            <h3 className="text-xl sm:text-2xl font-black text-gray-900 tracking-tight">{t.planning.knowledgeBase}</h3>
             <p className="text-sm text-gray-500 font-medium">{t.planning.knowledgeBaseDesc} {selectedState}.</p>
           </div>
-          <div className="p-3 bg-emerald-950 text-emerald-400 rounded-2xl shadow-xl">
+          <div className="p-3 bg-emerald-950 text-emerald-400 rounded-2xl shadow-xl shrink-0">
             <Sprout className="w-6 h-6" />
           </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-          <KnowledgeCard 
-            title={t.planning.stapleCrops} 
-            crops={["Paddy", "Wheat", "Maize"]} 
+          <KnowledgeCard
+            title={t.planning.stapleCrops}
+            crops={["Paddy", "Wheat", "Maize"]}
             desc="Primary nutritional crops with high food security value and established procurement channels."
           />
-          <KnowledgeCard 
-            title={t.planning.cashCrops} 
-            crops={["Sugarcane", "Cotton", "Tobacco"]} 
+          <KnowledgeCard
+            title={t.planning.cashCrops}
+            crops={["Sugarcane", "Cotton", "Tobacco"]}
             desc="High commercial focus crops requiring specialized input management and industrial linkage."
           />
-          <KnowledgeCard 
-            title={t.planning.horticulture} 
-            crops={["Mango", "Banana", "Citrus"]} 
+          <KnowledgeCard
+            title={t.planning.horticulture}
+            crops={["Mango", "Banana", "Citrus"]}
             desc="Perennial investment crops with potential for high export value and processing opportunities."
           />
-          <KnowledgeCard 
-            title={t.planning.soilBoosters} 
-            crops={["Moong", "Urad", "Mustard"]} 
+          <KnowledgeCard
+            title={t.planning.soilBoosters}
+            crops={["Moong", "Urad", "Mustard"]}
             desc="Short-duration crops that naturally replenish soil nitrogen and require minimal irrigation."
           />
         </div>
@@ -446,19 +535,246 @@ export default function CropPlanning({ selectedState }: { selectedState: string 
   );
 }
 
-function TimelineStep({ label, icon: Icon, active }: any) {
+function CardHeader({ icon: Icon, title }: { icon: any; title: string }) {
   return (
-    <div className="flex flex-col items-center gap-1">
-      <div className={cn(
-        "p-2 rounded-xl border relative z-20 transition-all",
-        active ? "bg-emerald-500 text-white border-emerald-400 shadow-md" : "bg-white text-gray-300 border-gray-100"
-      )}>
-        <Icon className="w-3.5 h-3.5" />
+    <div className="flex items-center gap-3 pb-4 border-b border-gray-100">
+      <div className="p-2 bg-emerald-50 rounded-xl text-emerald-600">
+        <Icon className="w-5 h-5" />
       </div>
-      <span className={cn(
-        "text-[10px] font-black uppercase tracking-widest",
-        active ? "text-emerald-600" : "text-gray-300"
-      )}>{label}</span>
+      <h3 className="font-bold text-gray-900">{title}</h3>
+    </div>
+  );
+}
+
+function SoilSourcePanel({
+  soil,
+  onRetry,
+  dateLocale,
+}: {
+  soil: SoilState;
+  onRetry: () => void;
+  dateLocale: string;
+}) {
+  const { t } = useLanguage();
+  const ts = t.planning.soil;
+
+  if (soil.status === "idle") {
+    return (
+      <div className="flex gap-3 items-start bg-gray-50 border border-gray-100 rounded-2xl p-4 text-xs text-gray-600 leading-relaxed">
+        <Info className="w-4 h-4 shrink-0 text-gray-400 mt-0.5" />
+        <p>{ts.idleHint}</p>
+      </div>
+    );
+  }
+  if (soil.status === "loading") {
+    return (
+      <div className="flex gap-3 items-center bg-emerald-50/50 border border-emerald-100 rounded-2xl p-4 text-xs font-medium text-emerald-800" role="status">
+        <Loader2 className="w-4 h-4 animate-spin" /> {ts.fetching}
+      </div>
+    );
+  }
+  const unavailable = soil.status === "done" && soil.data.status === "unavailable" ? soil.data : null;
+  if (soil.status === "error" || unavailable) {
+    const message = unavailable ? ts.unavailable[unavailable.reason] : ts.unavailable.error;
+    return (
+      <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 text-xs text-amber-900 space-y-2" role="alert">
+        <div className="flex gap-3 items-start">
+          <AlertTriangle className="w-4 h-4 shrink-0 text-amber-500 mt-0.5" />
+          <div className="space-y-1">
+            <p className="font-bold">{message}</p>
+            <p>{ts.nextStep}</p>
+          </div>
+        </div>
+        {soil.status === "error" && (
+          <button type="button" onClick={onRetry} className="ml-7 font-bold flex items-center gap-1 hover:underline">
+            <RefreshCw className="w-3 h-3" /> {ts.retry}
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  if (soil.status !== "done" || soil.data.status !== "available") return null;
+  const d = soil.data;
+  return (
+    <div className="bg-emerald-50/60 border border-emerald-100 rounded-2xl p-4 space-y-3 text-xs">
+      <div className="flex items-center justify-between gap-2">
+        <p className="font-black text-emerald-900 uppercase tracking-widest text-[10px]">{ts.summaryTitle}</p>
+        <SourceBadge kind="area" />
+      </div>
+      <dl className="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-2 text-emerald-950">
+        <div>
+          <dt className="text-[10px] text-emerald-700/70 font-bold uppercase tracking-wider">{ts.area}</dt>
+          <dd className="font-bold">{d.area.name} <span className="font-medium text-emerald-700">({ts.levels[d.level]})</span></dd>
+        </div>
+        <div>
+          <dt className="text-[10px] text-emerald-700/70 font-bold uppercase tracking-wider">{ts.cycle}</dt>
+          <dd className="font-bold">{d.cycle}</dd>
+        </div>
+        <div>
+          <dt className="text-[10px] text-emerald-700/70 font-bold uppercase tracking-wider">{ts.samples}</dt>
+          <dd className="font-bold">{d.sampleCount.toLocaleString(dateLocale)}</dd>
+        </div>
+        <div>
+          <dt className="text-[10px] text-emerald-700/70 font-bold uppercase tracking-wider">{ts.lastProcessed}</dt>
+          <dd className="font-bold">{d.lastUpdated ? new Date(d.lastUpdated).toLocaleDateString(dateLocale, { day: "numeric", month: "short", year: "numeric" }) : "—"}</dd>
+        </div>
+      </dl>
+      {d.fallbackReason && (
+        <p className="flex gap-2 items-start bg-amber-50 border border-amber-200 text-amber-900 rounded-xl px-3 py-2">
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-amber-500 mt-0.5" /> {ts.fallback[d.fallbackReason]}
+        </p>
+      )}
+      <p className="text-emerald-900/80 leading-relaxed">{ts.unitsNote} {ts.disclaimer}</p>
+      <p className="text-[10px] text-emerald-700/70">
+        {ts.source}:{" "}
+        <a href={d.source.url} target="_blank" rel="noopener noreferrer" className="underline inline-flex items-center gap-0.5">
+          {d.source.name} <ExternalLink className="w-3 h-3" />
+        </a>
+      </p>
+    </div>
+  );
+}
+
+function SourceBadge({ kind }: { kind: "area" | "manual" | "missing" }) {
+  const { t } = useLanguage();
+  const ts = t.planning.soil;
+  const styles = {
+    area: "bg-emerald-100 text-emerald-800 border-emerald-200",
+    manual: "bg-blue-100 text-blue-800 border-blue-200",
+    missing: "bg-gray-100 text-gray-500 border-gray-200",
+  };
+  const label = { area: ts.badgeEstimate, manual: ts.badgeManual, missing: ts.badgeUnavailable }[kind];
+  return (
+    <span className={cn("px-2 py-0.5 rounded-full border text-[10px] font-bold whitespace-nowrap shrink-0", styles[kind])}>{label}</span>
+  );
+}
+
+const RATING_COLORS: Record<string, string> = {
+  Low: "bg-rose-400",
+  Medium: "bg-amber-400",
+  High: "bg-emerald-500",
+  Acidic: "bg-orange-400",
+  Neutral: "bg-emerald-500",
+  Alkaline: "bg-blue-400",
+};
+
+const RATING_TEXT: Record<string, string> = {
+  Low: "text-rose-600",
+  Medium: "text-amber-600",
+  High: "text-emerald-700",
+  Acidic: "text-orange-600",
+  Neutral: "text-emerald-700",
+  Alkaline: "text-blue-600",
+};
+
+// Auto-filled, read-only soil value: the area soil-test rating, the farmer's own report value, or
+// an explicit "Not available". Never a made-up number.
+function SoilValue({
+  label,
+  status,
+  unit,
+  loading,
+}: {
+  label: string;
+  status: FieldStatus;
+  unit: string;
+  loading: boolean;
+}) {
+  const { t } = useLanguage();
+  const ts = t.planning.soil;
+  const ratingKey = (s: string) => (ts.ratings as Record<string, string>)[s] ?? s;
+  const area = status.kind === "area" ? status.area : null;
+
+  return (
+    <div className="rounded-2xl border border-gray-100 bg-gray-50/50 p-4 space-y-2 h-full min-w-0" data-soil-field={label}>
+      <div className="flex flex-col items-start gap-1.5">
+        <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">{label}</p>
+        {!loading && <SourceBadge kind={status.kind} />}
+      </div>
+
+      {loading ? (
+        <div className="h-7 w-24 bg-gray-100 rounded-lg animate-pulse" role="status" aria-label={ts.fetching} />
+      ) : status.kind === "manual" ? (
+        <p className={cn("text-xl font-black", status.valid ? "text-blue-900" : "text-rose-600")} data-soil-value>
+          {Number.isFinite(status.value) ? status.value : "—"} {unit && <span className="text-xs font-bold text-blue-700/70">{unit}</span>}
+        </p>
+      ) : area ? (
+        <>
+          <p className={cn("text-xl font-black", RATING_TEXT[area.dominant] ?? "text-gray-900")} data-soil-value>
+            {ratingKey(area.dominant)}
+          </p>
+          <p className="text-[11px] text-gray-500">
+            {fmt(ts.samplesRated, { share: area.dominantShare, total: area.total, rating: ratingKey(area.dominant) })}
+          </p>
+          <div className="flex h-1.5 rounded-full overflow-hidden bg-gray-100" aria-hidden="true">
+            {Object.entries(area.counts).map(([cls, count]) =>
+              count > 0 ? (
+                <div key={cls} className={RATING_COLORS[cls] ?? "bg-gray-300"} style={{ width: `${(count / area.total) * 100}%` }} title={`${ratingKey(cls)}: ${count}`} />
+              ) : null,
+            )}
+          </div>
+          <p className="text-[10px] text-gray-400">
+            {Object.entries(area.counts).map(([cls, count]) => `${ratingKey(cls)} ${count}`).join(" · ")}
+          </p>
+        </>
+      ) : (
+        <p className="text-sm font-bold text-gray-400" data-soil-value>{ts.notAvailable}</p>
+      )}
+    </div>
+  );
+}
+
+function ReportInput({
+  soilKey,
+  label,
+  raw,
+  invalid,
+  onChange,
+}: {
+  soilKey: SoilKey;
+  label: string;
+  raw: string;
+  invalid: boolean;
+  onChange: (value: string) => void;
+}) {
+  const { t } = useLanguage();
+  const ts = t.planning.soil;
+  const bounds = SOIL_BOUNDS[soilKey];
+  const inputId = `soil-${soilKey}`;
+  return (
+    <div className="space-y-1">
+      <label htmlFor={inputId} className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">{label}</label>
+      <div className="relative">
+        <input
+          id={inputId}
+          type="number"
+          inputMode="decimal"
+          step={bounds.step}
+          min={bounds.min}
+          max={bounds.max}
+          value={raw}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={ts.manualPlaceholder}
+          aria-invalid={invalid}
+          aria-describedby={invalid ? `${inputId}-error` : undefined}
+          className={cn(
+            "w-full bg-white border rounded-xl pl-4 pr-20 py-2.5 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all",
+            invalid ? "border-rose-300" : "border-gray-200",
+          )}
+        />
+        <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+          {soilKey !== "ph" && <span className="text-[10px] text-gray-400 font-medium">{ts.unit}</span>}
+          {raw !== "" && (
+            <button type="button" onClick={() => onChange("")} className="p-1 text-gray-400 hover:text-gray-700" aria-label={ts.clear} title={ts.clear}>
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+      </div>
+      {invalid && (
+        <p id={`${inputId}-error`} className="text-[11px] text-rose-600">{fmt(ts.outOfRange, { min: bounds.min, max: bounds.max })}</p>
+      )}
     </div>
   );
 }
@@ -466,9 +782,8 @@ function TimelineStep({ label, icon: Icon, active }: any) {
 function KnowledgeCard({ title, crops, desc }: any) {
   return (
     <div className="bg-white border border-gray-100 rounded-3xl p-6 hover:shadow-md transition-all">
-      <h4 className="font-bold text-gray-900 mb-2 flex items-center justify-between">
+      <h4 className="font-bold text-gray-900 mb-2">
         {title}
-        <span className="text-[10px] bg-gray-100 px-2 py-0.5 rounded-full text-gray-500">State Specific</span>
       </h4>
       <div className="flex flex-wrap gap-2 mb-4">
         {crops.map((crop: string) => (
@@ -484,74 +799,3 @@ function KnowledgeCard({ title, crops, desc }: any) {
   );
 }
 
-function ResultStat({ label, value, icon: Icon, unit }: any) {
-  return (
-    <div className="space-y-1">
-      <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{label}</p>
-      <div className="flex items-center gap-2">
-        <div className="p-1 bg-gray-50 rounded-lg">
-          <Icon className="w-3 h-3 text-emerald-500" />
-        </div>
-        <span className="text-lg font-bold text-gray-900 truncate">{value}</span>
-      </div>
-      <p className="text-[10px] text-gray-400 font-medium italic">{unit}</p>
-    </div>
-  );
-}
-
-function NutrientInput({ label, value, onChange, color, max, step = 1 }: any) {
-  const colorMap: any = {
-    emerald: "bg-emerald-500",
-    blue: "bg-blue-500",
-    amber: "bg-amber-500",
-    purple: "bg-purple-500"
-  };
-
-  const percentage = (value / max) * 100;
-
-  return (
-    <div className="space-y-2">
-      <div className="flex justify-between items-end">
-        <label className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">{label}</label>
-        <span className="text-xs font-bold text-gray-900">{value}</span>
-      </div>
-      <div className="relative group">
-        <input 
-          type="number" 
-          step={step}
-          value={value}
-          onChange={(e) => onChange(Number(e.target.value))}
-          className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all"
-        />
-        <div className="absolute bottom-0 left-0 right-0 h-1 bg-gray-100 rounded-b-xl overflow-hidden">
-          <motion.div 
-            initial={{ width: 0 }}
-            animate={{ width: `${Math.min(percentage, 100)}%` }}
-            className={cn("h-full transition-all", colorMap[color])}
-          />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function RequirementCard({ icon: Icon, label, value, color }: any) {
-  const colorMap: any = {
-    blue: "bg-blue-50 text-blue-600 border-blue-100",
-    amber: "bg-amber-50 text-amber-600 border-amber-100",
-    orange: "bg-orange-50 text-orange-600 border-orange-100",
-    emerald: "bg-emerald-50 text-emerald-600 border-emerald-100"
-  };
-
-  return (
-    <div className={cn("p-4 rounded-2xl border flex gap-3 items-center", colorMap[color])}>
-      <div className="p-2 bg-white rounded-xl shadow-sm">
-        <Icon className="w-4 h-4" />
-      </div>
-      <div>
-        <p className="text-[10px] font-bold uppercase tracking-widest opacity-70">{label}</p>
-        <p className="text-xs font-bold truncate">{value || "Moderate"}</p>
-      </div>
-    </div>
-  );
-}

@@ -11,6 +11,7 @@ import {
   Languages
 } from "lucide-react";
 import { cn } from "@/src/lib/utils";
+import { indianStates } from "@/src/lib/indianStates";
 import { useState } from "react";
 
 import { useLanguage } from "../contexts/LanguageContext";
@@ -20,48 +21,11 @@ interface SidebarProps {
   setActiveTab: (tab: string) => void;
   selectedState: string;
   setSelectedState: (state: string) => void;
+  isOpen?: boolean;
+  onClose?: () => void;
 }
 
-const indianStates = [
-  "Andaman and Nicobar Islands",
-  "Andhra Pradesh",
-  "Arunachal Pradesh",
-  "Assam",
-  "Bihar",
-  "Chandigarh",
-  "Chhattisgarh",
-  "Dadra and Nagar Haveli and Daman and Diu",
-  "Delhi",
-  "Goa",
-  "Gujarat",
-  "Haryana",
-  "Himachal Pradesh",
-  "Jammu and Kashmir",
-  "Jharkhand",
-  "Karnataka",
-  "Kerala",
-  "Ladakh",
-  "Lakshadweep",
-  "Madhya Pradesh",
-  "Maharashtra",
-  "Manipur",
-  "Meghalaya",
-  "Mizoram",
-  "Nagaland",
-  "Odisha",
-  "Puducherry",
-  "Punjab",
-  "Rajasthan",
-  "Sikkim",
-  "Tamil Nadu",
-  "Telangana",
-  "Tripura",
-  "Uttar Pradesh",
-  "Uttarakhand",
-  "West Bengal"
-].sort();
-
-export default function Sidebar({ activeTab, setActiveTab, selectedState, setSelectedState }: SidebarProps) {
+export default function Sidebar({ activeTab, setActiveTab, selectedState, setSelectedState, isOpen = false, onClose }: SidebarProps) {
   const { language, setLanguage, t } = useLanguage();
   const [isLangMenuOpen, setIsLangMenuOpen] = useState(false);
 
@@ -80,7 +44,14 @@ export default function Sidebar({ activeTab, setActiveTab, selectedState, setSel
   ];
 
   return (
-    <div className="w-64 h-screen bg-emerald-950 text-emerald-50 flex flex-col fixed left-0 top-0 border-r border-emerald-800/50 transition-all z-50 overflow-hidden">
+    <>
+    {isOpen && (
+      <div className="fixed inset-0 bg-black/40 z-40 lg:hidden" onClick={onClose} aria-hidden="true" />
+    )}
+    <div className={cn(
+      "w-64 h-screen bg-emerald-950 text-emerald-50 flex flex-col fixed left-0 top-0 border-r border-emerald-800/50 transition-transform duration-300 z-50 overflow-y-auto lg:translate-x-0",
+      isOpen ? "translate-x-0" : "-translate-x-full"
+    )}>
       <div className="p-5 flex items-center gap-3 border-b border-emerald-800/30">
         <div className="bg-emerald-500 p-2 rounded-xl shadow-lg shadow-emerald-500/20 rotate-3 group-hover:rotate-0 transition-transform duration-500">
           <Tractor className="w-5 h-5 text-emerald-950" />
@@ -117,7 +88,7 @@ export default function Sidebar({ activeTab, setActiveTab, selectedState, setSel
         {navItems.map((item) => (
           <button
             key={item.id}
-            onClick={() => setActiveTab(item.id)}
+            onClick={() => { setActiveTab(item.id); onClose?.(); }}
             className={cn(
               "w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-300 group text-[10px] font-black uppercase tracking-widest",
               activeTab === item.id 
@@ -185,5 +156,6 @@ export default function Sidebar({ activeTab, setActiveTab, selectedState, setSel
         </div>
       </div>
     </div>
+    </>
   );
 }
